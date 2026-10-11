@@ -22,6 +22,7 @@ from aiogram.types import (
     CopyTextButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    LinkPreviewOptions,
     Message,
     ReplyKeyboardRemove,
 )
@@ -167,7 +168,7 @@ class KindCb(CallbackData, prefix="k"):
 
 
 class NavCb(CallbackData, prefix="n"):
-    action: str  # menu | today | habits | cal | add | tz | invite | help | cancel
+    action: str  # menu | today | habits | cal | add | tz | invite | invmsg | help | cancel
 
 
 class OverviewCb(CallbackData, prefix="o"):
@@ -506,25 +507,47 @@ def build_router(storage: Storage) -> Router:
         await state.clear()
         await message.answer(HELP, reply_markup=only_menu())
 
+    async def pretty_invitation(bot: Bot, user_id: int) -> str:
+        """Приглашение со ссылкой, зашитой в название бота, — для показа и пересылки."""
+        me = await bot.me()
+        link = await ref_link(bot, user_id)
+        return (
+            f'Веду привычки в боте <a href="{link}">{escape(me.first_name)}</a> — отметки, '
+            "напоминания и календарь. Присоединяйся!"
+        )
+
     async def invite_view(bot: Bot, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         link = await ref_link(bot, user_id)
-        invitation = f"{SHARE_TEXT}\n{link}"
         kb = InlineKeyboardBuilder()
-        # Кнопки копирования кладут текст в буфер обмена без выделения руками.
-        kb.button(text="📋 Скопировать приглашение", copy_text=CopyTextButton(text=invitation))
+        kb.button(text="✉️ Прислать для пересылки", callback_data=NavCb(action="invmsg"))
+        # Кнопки копирования кладут в буфер обычный текст: в нём ссылку спрятать нельзя.
+        kb.button(
+            text="📋 Скопировать текстом", copy_text=CopyTextButton(text=f"{SHARE_TEXT}\n{link}")
+        )
         kb.button(text="🔗 Скопировать ссылку", copy_text=CopyTextButton(text=link))
         kb.button(text=BTN_SHARE, url=await share_url(bot, user_id))
         menu_button(kb)
-        kb.adjust(1, 1, 2)
+        kb.adjust(1, 2, 2)
         text = (
             "<b>Пригласить друга</b>\n\n"
-            "Готовое приглашение — нажмите на текст или на кнопку ниже, чтобы скопировать:\n"
-            f"<code>{escape(invitation)}</code>\n\n"
-            "Только ссылка:\n"
-            f"<code>{link}</code>\n\n"
+            f"{await pretty_invitation(bot, user_id)}\n\n"
+            "Ссылка-приглашение зашита в название бота. Кнопка ниже пришлёт этот текст "
+            "отдельным сообщением — его удобно переслать.\n\n"
             f"Пришло по ссылке: <b>{storage.invited_count(user_id)}</b>"
         )
         return text, kb.as_markup()
+
+    @router.callback_query(NavCb.filter(F.action == "invmsg"))
+    async def send_invitation(query: CallbackQuery) -> None:
+        """Чистое сообщение-приглашение: при пересылке ссылка и кнопка сохраняются."""
+        kb = InlineKeyboardBuilder()
+        kb.button(text="Открыть трекер привычек", url=await ref_link(query.bot, query.from_user.id))
+        await query.message.answer(
+            await pretty_invitation(query.bot, query.from_user.id),
+            reply_markup=kb.as_markup(),
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+        await query.answer("Перешлите это сообщение другу")
 
     @router.callback_query(
         NavCb.filter(F.action.in_({"menu", "cancel", "today", "habits", "help", "invite"}))

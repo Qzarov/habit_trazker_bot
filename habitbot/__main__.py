@@ -39,7 +39,7 @@ async def main() -> None:
         os.environ.get("HABIT_DB", "habits.db"),
         default_tz=os.environ.get("DEFAULT_TZ", "Europe/Moscow"),
     )
-    bot = Bot(token, default=DefaultBotProperties(parse_mode="HTML"))
+    bot = Bot(token, default=DefaultBotProperties(parse_mode="HTML", link_preview_is_disabled=True))
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(build_router(storage))
     await bot.set_my_commands(COMMANDS)
