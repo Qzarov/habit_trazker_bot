@@ -98,3 +98,19 @@
 uv run ruff check .
 uv run pytest
 ```
+
+## Сервер
+
+Бот работает службой systemd `habit-bot` в `/opt/habit-bot` под отдельным пользователем
+`habitbot`; токен и база (`.env`, `habits.db`) лежат там же и в git не входят.
+
+```
+systemctl status habit-bot          # состояние
+journalctl -u habit-bot -f          # журнал
+systemctl restart habit-bot         # перезапуск
+```
+
+Обновление кода: распаковать новую версию в `/opt/habit-bot` (например,
+`git archive HEAD | ssh <сервер> 'tar -xf - -C /opt/habit-bot'`), при изменении зависимостей —
+`uv sync --no-dev` от имени `habitbot`, затем перезапустить службу. Одновременно бот должен
+работать только в одном месте: два процесса с одним токеном мешают друг другу.
