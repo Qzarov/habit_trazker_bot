@@ -55,7 +55,8 @@
 | Переменная | По умолчанию | Назначение |
 |---|---|---|
 | `BOT_TOKEN` | — | Токен от @BotFather. Обязательна |
-| `HABIT_DB` | `habits.db` | Путь к файлу базы SQLite |
+| `DATABASE_URL` | — | Адрес PostgreSQL: `postgresql://роль:пароль@хост:порт/база`. Если задан, используется он |
+| `HABIT_DB` | `habits.db` | Путь к файлу базы SQLite — когда `DATABASE_URL` не задан |
 | `DEFAULT_TZ` | `Europe/Moscow` | Часовой пояс для новых пользователей |
 
 `.env` и `*.db` исключены из git.
@@ -148,13 +149,15 @@
 |---|---|
 | `habitbot/__main__.py` | Запуск: чтение `.env`, бот, диспетчер, цикл напоминаний |
 | `habitbot/bot.py` | Все экраны, кнопки и диалоги (aiogram 3) |
-| `habitbot/db.py` | SQLite: пользователи, привычки, отметки, приглашения; расчёт серии |
+| `habitbot/db.py` | Хранилище (PostgreSQL или SQLite): пользователи, привычки, отметки, приглашения; расчёт серий |
+| `habitbot/migrate.py` | Перенос данных из файла SQLite в PostgreSQL |
 | `habitbot/reminders.py` | Цикл напоминаний раз в 30 секунд, разбор времени |
 | `habitbot/calendar_image.py` | Отрисовка календарей (matplotlib, эмодзи через Pillow) |
 | `tests/` | Логика и сценарии бота целиком на подставном Telegram |
 
-Данные — в одном файле SQLite. Схема создаётся и дополняется при запуске: база от прежней
-версии обновляется на месте. Состояние диалога («жду название») хранится в памяти и
+База — PostgreSQL на сервере и SQLite (один файл) при локальном запуске и в тестах; запросы
+общие для обеих. Схема создаётся при запуске; файл SQLite от прежней версии дополняется на
+месте. Даты и время хранятся текстом в формате ISO. Состояние диалога («жду название») хранится в памяти и
 сбрасывается при перезапуске; привычки и отметки при этом не теряются.
 
 Удаление привычки скрывает её, отметки в базе остаются.
@@ -166,11 +169,14 @@
 ## Деплой на сервер
 
 Ниже — как бот развёрнут сейчас: Ubuntu 22.04, служба systemd, отдельный пользователь без прав
-root. Адрес сервера в репозитории не хранится; в командах он обозначен `<сервер>`.
+root, база — PostgreSQL. Адрес сервера в репозитории не хранится; в командах он обозначен
+`<сервер>`.
 
 | Что | Где |
 |---|---|
-| Код, окружение, база, токен | `/opt/habit-bot` |
+| Код, окружение, токен, адрес базы | `/opt/habit-bot` (`.env`) |
+| База | PostgreSQL 16 в контейнере `rag-pg` (общий с другим проектом), база `habitbot`, роль `habitbot`; слушает только `127.0.0.1:5432` |
+| Копии прежней базы SQLite | `/opt/habit-bot/habits*.db` — после переезда не обновляются |
 | Служба | `habit-bot` (`/etc/systemd/system/habit-bot.service`) |
 | Пользователь | `habitbot` (системный, без входа) |
 | Python и пакеты | `/opt/habit-bot/.python`, `/opt/habit-bot/.venv` |
@@ -197,24 +203,35 @@ root. Адрес сервера в репозитории не хранится;
    git archive HEAD | ssh root@<сервер> 'tar -xf - -C /opt/habit-bot'
    ```
 
-3. Токен и, если переносите данные, база — тоже со своей машины:
+3. Токен — тоже со своей машины:
 
    ```
-   scp .env habits.db root@<сервер>:/opt/habit-bot/
+   scp .env root@<сервер>:/opt/habit-bot/
    ```
 
-4. Права и зависимости:
+4. База в PostgreSQL — отдельная роль и база, пароль придумайте свой:
+
+   ```
+   docker exec rag-pg psql -U postgres -c "CREATE ROLE habitbot LOGIN PASSWORD '<пароль>'"
+   docker exec rag-pg psql -U postgres -c "CREATE DATABASE habitbot OWNER habitbot"
+   docker exec rag-pg psql -U postgres -c "REVOKE ALL ON DATABASE habitbot FROM PUBLIC"
+   echo 'DATABASE_URL=postgresql://habitbot:<пароль>@127.0.0.1:5432/habitbot' >> /opt/habit-bot/.env
+   ```
+
+   Таблицы бот создаст сам при первом запуске.
+
+5. Права и зависимости:
 
    ```
    cd /opt/habit-bot
    chown -R habitbot:habitbot .
-   chmod 600 .env habits.db
+   chmod 600 .env
    sudo -u habitbot env HOME=/opt/habit-bot \
      UV_PYTHON_INSTALL_DIR=/opt/habit-bot/.python UV_CACHE_DIR=/opt/habit-bot/.cache/uv \
      uv sync --no-dev
    ```
 
-5. Служба — файл `/etc/systemd/system/habit-bot.service`:
+6. Служба — файл `/etc/systemd/system/habit-bot.service`:
 
    ```ini
    [Unit]
@@ -256,8 +273,7 @@ git archive HEAD | ssh root@<сервер> 'tar -xf - -C /opt/habit-bot && chown
 ```
 
 Если менялись зависимости (`pyproject.toml`, `uv.lock`), перед перезапуском выполните на сервере
-`uv sync --no-dev` той же командой, что в шаге 4. Базу и `.env` обновление не трогает: в архив
-git они не входят.
+`uv sync --no-dev` той же командой, что в шаге 5. Базу и `.env` обновление не трогает.
 
 ### Эксплуатация
 
@@ -269,14 +285,34 @@ systemctl restart habit-bot         # перезапуск
 systemctl stop habit-bot            # остановка
 ```
 
-Резервная копия базы — со своей машины:
+В журнале при запуске есть строка `storage: postgresql` — по ней видно, с какой базой бот
+работает. Если `DATABASE_URL` пропадёт из `.env`, бот молча начнёт с файла SQLite.
+
+Резервная копия базы — на сервере:
 
 ```
-ssh root@<сервер> 'sqlite3 /opt/habit-bot/habits.db ".backup /tmp/habits.db"' \
-  && scp root@<сервер>:/tmp/habits.db ./habits.backup.db
+docker exec rag-pg pg_dump -U postgres -Fc habitbot > /root/backups/habitbot-$(date +%F).dump
 ```
 
-Если `sqlite3` на сервере нет, остановите службу, скопируйте файл `habits.db` и запустите снова.
+Восстановление в пустую базу: `docker exec -i rag-pg pg_restore -U postgres -d habitbot < файл.dump`.
+Автоматических копий нет.
+
+Зайти в базу: `docker exec -it rag-pg psql -U postgres -d habitbot`.
+
+### Перенос данных из SQLite
+
+Если бот раньше работал на файле SQLite:
+
+```
+systemctl stop habit-bot
+cd /opt/habit-bot
+sudo -u habitbot .venv/bin/python -m habitbot.migrate habits.db 'postgresql://habitbot:<пароль>@127.0.0.1:5432/habitbot'
+# затем добавить DATABASE_URL в .env и запустить службу
+systemctl start habit-bot
+```
+
+Скрипт переносит все таблицы с теми же идентификаторами, сверяет число строк и ничего не пишет
+в непустую базу.
 
 Смена токена: впишите новый в `/opt/habit-bot/.env` и перезапустите службу.
 
@@ -300,7 +336,9 @@ uv run ruff check .
 uv run pytest
 ```
 
-Тесты не обращаются к Telegram: сценарии подаются в диспетчер, сетевой слой подменён.
+Тесты не обращаются к Telegram: сценарии подаются в диспетчер, сетевой слой подменён. По
+умолчанию они идут на SQLite в памяти. Чтобы прогнать их на PostgreSQL, задайте
+`TEST_DATABASE_URL` с адресом **отдельной тестовой** базы — тесты очищают в ней таблицы.
 
 ## Ограничения
 
