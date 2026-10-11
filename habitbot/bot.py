@@ -19,9 +19,8 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InputMediaPhoto,
-    KeyboardButton,
     Message,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -32,12 +31,13 @@ from .reminders import parse_time, zone
 MAX_NAME = 60
 MAX_HABITS = 30
 
-# Кнопки постоянного меню под полем ввода: ими пользуются вместо команд.
+# Подписи кнопок главного меню (инлайн-кнопки под сообщением).
 BTN_TODAY = "📋 Сегодня"
 BTN_HABITS = "📚 Привычки"
 BTN_ADD = "➕ Добавить"
 BTN_TZ = "🌍 Часовой пояс"
 BTN_HELP = "❓ Помощь"
+BTN_MENU = "☰ Меню"
 
 # Команды остаются запасным входом; в списке команд Telegram — только самое нужное.
 COMMANDS = [
@@ -46,7 +46,7 @@ COMMANDS = [
 ]
 
 HELP = (
-    "Я помогаю следить за привычками. Всё управление — кнопками внизу.\n\n"
+    "Я помогаю следить за привычками. Всё управление — кнопками под сообщениями.\n\n"
     "• <b>Полезные</b> — отмечайте дни, когда сделали. Зелёный день в календаре — сделано.\n"
     "• <b>Вредные</b> — отмечайте дни, когда сорвались. Красный день — было, зелёный — не было.\n"
     "• У каждой привычки свой эмодзи — им помечены отмеченные дни на картинке.\n\n"
@@ -67,19 +67,18 @@ QUICK_ZONES = [
 ]  # fmt: skip
 
 
-def main_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_TODAY), KeyboardButton(text=BTN_HABITS)],
-            [
-                KeyboardButton(text=BTN_ADD),
-                KeyboardButton(text=BTN_TZ),
-                KeyboardButton(text=BTN_HELP),
-            ],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-    )
+def main_menu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=BTN_TODAY, callback_data=NavCb(action="today"))
+    kb.button(text=BTN_HABITS, callback_data=NavCb(action="habits"))
+    kb.button(text=BTN_ADD, callback_data=NavCb(action="add"))
+    kb.button(text=BTN_TZ, callback_data=NavCb(action="tz"))
+    kb.button(text=BTN_HELP, callback_data=NavCb(action="help"))
+    kb.adjust(2, 2, 1)
+    return kb.as_markup()
+
+
+MENU_TEXT = "<b>Трекер привычек</b>\nЧто делаем?"
 
 
 def clean_emoji(text: str) -> str | None:
@@ -145,7 +144,7 @@ class KindCb(CallbackData, prefix="k"):
 
 
 class NavCb(CallbackData, prefix="n"):
-    action: str  # add | cancel
+    action: str  # menu | today | habits | add | tz | help | cancel
 
 
 class TimeCb(CallbackData, prefix="t"):
@@ -178,7 +177,16 @@ def build_router(storage: Storage) -> Router:
     def empty_view() -> tuple[str, InlineKeyboardMarkup]:
         kb = InlineKeyboardBuilder()
         kb.button(text=BTN_ADD, callback_data=NavCb(action="add"))
+        menu_button(kb)
         return "Привычек пока нет. Добавьте первую.", kb.as_markup()
+
+    def menu_button(kb: InlineKeyboardBuilder) -> None:
+        kb.button(text=BTN_MENU, callback_data=NavCb(action="menu"))
+
+    def only_menu() -> InlineKeyboardMarkup:
+        kb = InlineKeyboardBuilder()
+        menu_button(kb)
+        return kb.as_markup()
 
     def cancel_button(kb: InlineKeyboardBuilder) -> None:
         kb.button(text="Отмена", callback_data=NavCb(action="cancel"))
@@ -216,6 +224,7 @@ def build_router(storage: Storage) -> Router:
                 text=mark_label(habit, storage.is_marked(habit.id, day)),
                 callback_data=MarkCb(id=habit.id, back=0, src="t"),
             )
+        menu_button(kb)
         kb.adjust(1)
         text = (
             f"<b>Сегодня, {day.day} {MONTHS[day.month].lower()}</b>\n"
@@ -235,6 +244,7 @@ def build_router(storage: Storage) -> Router:
                 callback_data=HabitCb(action="open", id=habit.id),
             )
         kb.button(text=BTN_ADD, callback_data=NavCb(action="add"))
+        menu_button(kb)
         kb.adjust(1)
         return "<b>Мои привычки</b>\nНажмите на привычку, чтобы открыть её.", kb.as_markup()
 
@@ -338,67 +348,56 @@ def build_router(storage: Storage) -> Router:
         return image, caption, kb.as_markup()
 
     # --- меню и общие команды ---
-    # Кнопки меню стоят первыми и не смотрят на состояние диалога: нажатие «Сегодня» посреди
-    # добавления привычки открывает список, а не становится её названием.
 
     @router.message(CommandStart())
     async def start(message: Message, state: FSMContext) -> None:
         await state.clear()
         storage.ensure_user(message.from_user.id)
-        await message.answer("Привет! " + HELP, reply_markup=main_menu())
+        # Первым сообщением убираем клавиатуру прежних версий, если она осталась на экране.
+        await message.answer("Привет! " + HELP, reply_markup=ReplyKeyboardRemove())
+        await message.answer(MENU_TEXT, reply_markup=main_menu())
 
     @router.message(Command("help"))
-    @router.message(F.text == BTN_HELP)
     async def help_(message: Message, state: FSMContext) -> None:
         await state.clear()
-        await message.answer(HELP, reply_markup=main_menu())
+        await message.answer(HELP, reply_markup=only_menu())
 
-    @router.message(Command("cancel"))
-    async def cancel(message: Message, state: FSMContext) -> None:
+    @router.callback_query(
+        NavCb.filter(F.action.in_({"menu", "cancel", "today", "habits", "help"}))
+    )
+    async def navigate(query: CallbackQuery, callback_data: NavCb, state: FSMContext) -> None:
+        """Переходы по меню: тот же экран перерисовывается в том же сообщении."""
         await state.clear()
-        await message.answer("Отменено.", reply_markup=main_menu())
-
-    @router.callback_query(NavCb.filter(F.action == "cancel"))
-    async def cancel_button_pressed(query: CallbackQuery, state: FSMContext) -> None:
-        await state.clear()
-        await query.message.edit_text("Отменено.")
-        await query.answer()
-
-    @router.message(Command("today"))
-    @router.message(F.text == BTN_TODAY)
-    async def today(message: Message, state: FSMContext) -> None:
-        await state.clear()
-        text, kb = today_view(message.from_user.id)
-        await message.answer(text, reply_markup=kb)
-
-    @router.message(Command("habits"))
-    @router.message(F.text == BTN_HABITS)
-    async def habits(message: Message, state: FSMContext) -> None:
-        await state.clear()
-        text, kb = list_view(message.from_user.id)
-        await message.answer(text, reply_markup=kb)
+        user_id = query.from_user.id
+        if callback_data.action == "today":
+            text, kb = today_view(user_id)
+        elif callback_data.action == "habits":
+            text, kb = list_view(user_id)
+        elif callback_data.action == "help":
+            text, kb = HELP, only_menu()
+        else:
+            text, kb = MENU_TEXT, main_menu()
+        await query.message.edit_text(text, reply_markup=kb)
+        await query.answer("Отменено" if callback_data.action == "cancel" else None)
 
     # --- добавление: название → тип → эмодзи → напоминание ---
 
-    async def begin_add(user_id: int, state: FSMContext) -> tuple[str, InlineKeyboardMarkup | None]:
+    async def begin_add(user_id: int, state: FSMContext) -> tuple[str, InlineKeyboardMarkup]:
         await state.clear()
         if len(storage.list_habits(user_id)) >= MAX_HABITS:
-            return f"Уже {MAX_HABITS} привычек — удалите лишние в разделе «{BTN_HABITS}».", None
+            return (
+                f"Уже {MAX_HABITS} привычек — удалите лишние в разделе «{BTN_HABITS}».",
+                only_menu(),
+            )
         await state.set_state(Add.name)
         kb = InlineKeyboardBuilder()
         cancel_button(kb)
         return "Как называется привычка? Например: «Зарядка» или «Сладкое».", kb.as_markup()
 
-    @router.message(Command("add"))
-    @router.message(F.text == BTN_ADD)
-    async def add(message: Message, state: FSMContext) -> None:
-        text, kb = await begin_add(message.from_user.id, state)
-        await message.answer(text, reply_markup=kb)
-
     @router.callback_query(NavCb.filter(F.action == "add"))
-    async def add_from_button(query: CallbackQuery, state: FSMContext) -> None:
+    async def add(query: CallbackQuery, state: FSMContext) -> None:
         text, kb = await begin_add(query.from_user.id, state)
-        await query.message.answer(text, reply_markup=kb)
+        await query.message.edit_text(text, reply_markup=kb)
         await query.answer()
 
     @router.message(Add.name, F.text)
@@ -674,7 +673,8 @@ def build_router(storage: Storage) -> Router:
             await query.message.edit_text(text, reply_markup=kb)
         else:  # ответ на напоминание — кнопки больше не нужны
             await query.message.edit_text(
-                f"<b>{escape(habit.name)}</b>\n{note}\n{streak_line(habit, today_of(habit.user_id))}"
+                f"<b>{escape(habit.name)}</b>\n{note}\n{streak_line(habit, today_of(habit.user_id))}",
+                reply_markup=only_menu(),
             )
         await query.answer(note)
 
@@ -744,10 +744,9 @@ def build_router(storage: Storage) -> Router:
 
     # --- часовой пояс ---
 
-    @router.message(Command("tz"))
-    @router.message(F.text == BTN_TZ)
-    async def tz(message: Message, state: FSMContext) -> None:
-        current = storage.get_tz(message.from_user.id)
+    @router.callback_query(NavCb.filter(F.action == "tz"))
+    async def tz(query: CallbackQuery, state: FSMContext) -> None:
+        current = storage.get_tz(query.from_user.id)
         now = datetime.now(zone(current)).strftime("%H:%M")
         await state.set_state(Tz.value)
         kb = InlineKeyboardBuilder()
@@ -755,12 +754,13 @@ def build_router(storage: Storage) -> Router:
             kb.button(text=f"{city} +{offset}", callback_data=TzCb(offset=offset))
         cancel_button(kb)
         kb.adjust(2)
-        await message.answer(
+        await query.message.edit_text(
             f"Сейчас пояс <b>{current}</b>, у вас {now}.\n"
             "Выберите город или пришлите название пояса (Europe/Berlin) либо смещение "
             "от UTC (+1, -5).",
             reply_markup=kb.as_markup(),
         )
+        await query.answer()
 
     def tz_done(user_id: int, name: str) -> str:
         storage.set_tz(user_id, name)
@@ -774,7 +774,7 @@ def build_router(storage: Storage) -> Router:
         if name is None:
             await query.answer("Не знаю такой пояс.", show_alert=True)
             return
-        await query.message.edit_text(tz_done(query.from_user.id, name))
+        await query.message.edit_text(tz_done(query.from_user.id, name), reply_markup=only_menu())
         await query.answer()
 
     @router.message(Tz.value, F.text)
@@ -784,13 +784,13 @@ def build_router(storage: Storage) -> Router:
             await message.answer("Не знаю такой пояс. Пример: Europe/Berlin или +3.")
             return
         await state.clear()
-        await message.answer(tz_done(message.from_user.id, name))
+        await message.answer(tz_done(message.from_user.id, name), reply_markup=only_menu())
 
     # --- всё остальное ---
 
     @router.message()
     async def fallback(message: Message) -> None:
-        await message.answer("Не понял. Пользуйтесь кнопками меню внизу.", reply_markup=main_menu())
+        await message.answer(MENU_TEXT, reply_markup=main_menu())
 
     return router
 
