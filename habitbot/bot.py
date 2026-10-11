@@ -429,6 +429,17 @@ def build_router(storage: Storage) -> Router:
         kb.adjust(*rows, nav, 2)
         return image, caption, kb.as_markup()
 
+    def overview_habit(habit: Habit, day: date) -> OverviewHabit:
+        marks = storage.all_marks(habit.id)
+        return OverviewHabit(
+            name=habit.name,
+            emoji=habit.icon,
+            is_bad=habit.is_bad,
+            marks=frozenset(marks),
+            clean_days=streak(habit, marks, day) if habit.is_bad else None,
+            best_days=best_clean_streak(habit, marks, day) if habit.is_bad else None,
+        )
+
     def overview_view(
         user_id: int, year: int, month: int
     ) -> tuple[bytes, str, InlineKeyboardMarkup]:
@@ -438,15 +449,7 @@ def build_router(storage: Storage) -> Router:
         image = render_overview(
             year=year,
             month=month,
-            habits=[
-                OverviewHabit(
-                    name=h.name,
-                    emoji=h.icon,
-                    is_bad=h.is_bad,
-                    marks=frozenset(storage.all_marks(h.id)),
-                )
-                for h in habits
-            ],
+            habits=[overview_habit(h, day) for h in habits],
             today=day,
         )
         caption = (
@@ -617,9 +620,16 @@ def build_router(storage: Storage) -> Router:
         lines = [f"<b>Мои привычки</b> · {MONTHS[month]} {year}"]
         habits = storage.list_habits(user_id)
         for h in habits[:SHARE_HABITS]:
-            count = month_count(storage.all_marks(h.id), year, month)
+            marks = storage.all_marks(h.id)
+            count = month_count(marks, year, month)
             what = "срывов" if h.is_bad else "дней"
-            lines.append(f"{h.icon} {escape(h.name)} — {what}: <b>{count}</b>")
+            line = f"{h.icon} {escape(h.name)} — {what}: <b>{count}</b>"
+            if h.is_bad:
+                line += (
+                    f", без срыва {streak(h, marks, day)} дн., "
+                    f"лучшая серия {best_clean_streak(h, marks, day)} дн."
+                )
+            lines.append(line)
         if len(habits) > SHARE_HABITS:
             lines.append(f"…и ещё {len(habits) - SHARE_HABITS}")
         return "\n".join(lines)

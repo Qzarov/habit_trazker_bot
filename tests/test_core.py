@@ -197,6 +197,9 @@ def test_render_overview() -> None:
         OverviewHabit("Сладкое", "🍬", True, frozenset({date(2026, 10, 8)})),
     ]
     image = render_overview(year=2026, month=10, habits=habits, today=TODAY)
+    # Со строкой серий у вредной привычки легенда выше — картинка другая.
+    with_streaks = [habits[0], OverviewHabit("Сладкое", "🍬", True, habits[1].marks, 3, 9)]
+    assert render_overview(year=2026, month=10, habits=with_streaks, today=TODAY) != image
     empty = render_overview(year=2026, month=10, habits=[], today=TODAY)
     assert image.startswith(b"\x89PNG") and empty.startswith(b"\x89PNG")
     assert image != empty

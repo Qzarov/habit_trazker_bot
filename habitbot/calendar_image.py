@@ -251,6 +251,9 @@ class OverviewHabit:
     emoji: str
     is_bad: bool
     marks: frozenset[date]
+    #: Для вредной привычки: дни без срыва сейчас и лучшая серия; у полезной — пусто.
+    clean_days: int | None = None
+    best_days: int | None = None
 
 
 #: Сколько значков помещается в клетке дня: три в ряд, два ряда.
@@ -262,11 +265,14 @@ def render_overview(*, year: int, month: int, habits: list[OverviewHabit], today
 
     Полезная привычка на зелёной плашке (сделано), вредная — на красной (было). Если отмеченных
     в день больше, чем помещается, последняя ячейка показывает «+N». Под сеткой — легенда:
-    значок, название и число отмеченных дней за месяц.
+    значок, название и число отмеченных дней за месяц; у вредных привычек второй строкой —
+    дни без срыва сейчас и лучшая серия.
     """
     weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(year, month)
     legend_rows = (len(habits) + 1) // 2
-    bottom = -len(weeks) - 0.35 - 0.42 * max(legend_rows, 1) - 0.2
+    # Строка легенды выше, если у привычек есть вторая строчка с сериями.
+    row_height = 0.6 if any(h.clean_days is not None for h in habits) else 0.42
+    bottom = -len(weeks) - 0.35 - row_height * max(legend_rows, 1) - 0.2
     xlim, ylim = (0, 7), (bottom, 1.55)
     fig, ax = plt.subplots(figsize=(7, ylim[1] - ylim[0]), dpi=150)
     ax.set_aspect("equal")
@@ -332,11 +338,18 @@ def render_overview(*, year: int, month: int, habits: list[OverviewHabit], today
         ax.text(0.08, top - 0.2, "Привычек пока нет", fontsize=10, color=MUTED, va="center")
     for index, habit in enumerate(habits):
         x = 0.2 + 3.5 * (index % 2)
-        y = top - 0.2 - 0.42 * (index // 2)
+        y = top - 0.2 - row_height * (index // 2)
         chip(x, y, 0.3, habit)
         days = sum(1 for d in habit.marks if (d.year, d.month) == (year, month))
         name = habit.name if len(habit.name) <= 22 else habit.name[:21] + "…"
         ax.text(x + 0.27, y, f"{name} · {days}", fontsize=10, color=INK, va="center")
+        if habit.clean_days is not None and habit.best_days is not None:
+            ax.text(
+                x + 0.27, y - 0.24,
+                f"без срыва {habit.clean_days} {days_word(habit.clean_days)}"
+                f" · лучшая серия {habit.best_days}",
+                fontsize=8, color=MUTED, va="center",
+            )  # fmt: skip
 
     ax.set_xlim(*xlim)
     ax.set_ylim(*ylim)

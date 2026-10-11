@@ -385,7 +385,9 @@ async def test_share_calendar_sends_picture_with_stats_and_invitation(bot: Harne
     shared = (await bot.press(buttons(overview)["📣 Поделиться"], photo=True))[0]
     assert "<b>Мои привычки</b>" in shared.caption
     assert "💪 Зарядка — дней: <b>1</b>" in shared.caption
-    assert "🍬 Сладкое — срывов: <b>1</b>" in shared.caption
+    # У вредной — ещё и серии; сорвался сегодня, поэтому текущая 0.
+    assert "🍬 Сладкое — срывов: <b>1</b>, без срыва 0 дн., лучшая серия 0 дн." in shared.caption
+    assert "💪 Зарядка — дней: <b>1</b>\n" in shared.caption  # у полезной серий в строке нет
     assert f'href="{link}"' in shared.caption
 
 
