@@ -5,12 +5,62 @@ from __future__ import annotations
 import calendar
 import io
 from datetime import date
+from functools import lru_cache
+from pathlib import Path
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.patches import FancyBboxPatch
+from PIL import Image, ImageDraw, ImageFont
+
+#: Шрифты с цветными эмодзи и размер, в котором у них есть картинки (он у таких шрифтов один).
+EMOJI_FONTS = [
+    ("/System/Library/Fonts/Apple Color Emoji.ttc", 160),
+    ("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", 109),
+    ("/usr/share/fonts/noto/NotoColorEmoji.ttf", 109),
+    ("/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf", 109),
+]
+
+
+@lru_cache(maxsize=256)
+def emoji_image(emoji: str) -> np.ndarray | None:
+    """Эмодзи картинкой (RGBA) или `None`, если нарисовать нечем или не получилось.
+
+    Текстовый шрифт календаря цветных эмодзи не содержит, поэтому глиф берём из системного
+    шрифта эмодзи и вклеиваем изображением.
+    """
+    for path, size in EMOJI_FONTS:
+        if not Path(path).exists():
+            continue
+        try:
+            font = ImageFont.truetype(path, size)
+            canvas = Image.new("RGBA", (size * 3, size * 2), (0, 0, 0, 0))
+            ImageDraw.Draw(canvas).text(
+                (size // 4, size // 4), emoji, font=font, embedded_color=True
+            )
+        except (OSError, ValueError):
+            continue
+        box = canvas.getbbox()
+        if box is None:
+            continue
+        glyph = canvas.crop(box)
+        # Составные эмодзи без поддержки связок рисуются несколькими знаками в ряд — такой
+        # результат хуже, чем ничего.
+        if glyph.width > glyph.height * 1.35:
+            continue
+        side = max(glyph.size)
+        square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+        square.paste(glyph, ((side - glyph.width) // 2, (side - glyph.height) // 2))
+        return np.asarray(square)
+    return None
+
+
+def can_draw(emoji: str) -> bool:
+    return emoji_image(emoji) is not None
+
 
 MONTHS = [
     "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -48,21 +98,35 @@ def render_month(
     *,
     name: str,
     is_bad: bool,
+    emoji: str | None = None,
     year: int,
     month: int,
     marks: set[date],
     created_on: date,
     today: date,
 ) -> bytes:
-    """PNG с сеткой месяца (неделя с понедельника)."""
+    """PNG с сеткой месяца (неделя с понедельника).
+
+    Отмеченные дни несут эмодзи привычки: у полезной это дни «сделано», у вредной — «было».
+    """
     weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(year, month)
-    fig, ax = plt.subplots(figsize=(7, 1.9 + 0.95 * len(weeks)), dpi=150)
-    ax.set_xlim(0, 7)
-    ax.set_ylim(-len(weeks) - 0.75, 1.55)
+    xlim, ylim = (0, 7), (-len(weeks) - 0.75, 1.55)
+    # Дюйм на единицу по обеим осям: клетки и эмодзи остаются квадратными.
+    fig, ax = plt.subplots(figsize=(7, ylim[1] - ylim[0]), dpi=150)
+    ax.set_aspect("equal")
     ax.axis("off")
+    glyph = emoji_image(emoji) if emoji else None
+
+    def stamp(cx: float, cy: float, size: float) -> None:
+        half = size / 2
+        ax.imshow(glyph, extent=(cx - half, cx + half, cy - half, cy + half), zorder=3)
 
     kind = "вредная привычка" if is_bad else "полезная привычка"
-    ax.text(0.05, 1.2, name, fontsize=17, fontweight="bold", color=INK, va="center")
+    title_x = 0.05
+    if glyph is not None:
+        stamp(0.3, 1.2, 0.5)
+        title_x = 0.68
+    ax.text(title_x, 1.2, name, fontsize=17, fontweight="bold", color=INK, va="center")
     ax.text(0.05, 0.72, f"{MONTHS[month]} {year} · {kind}", fontsize=11, color=MUTED, va="center")
     for col, label in enumerate(WEEKDAYS):
         ax.text(col + 0.5, 0.2, label, fontsize=10, color=MUTED, ha="center", va="center")
@@ -91,6 +155,14 @@ def render_month(
                     linewidth=1.8,
                 )
             )
+            if glyph is not None and day in marks and style != "idle":
+                # Отмеченный день: эмодзи по центру, число — мелко в углу.
+                stamp(col + 0.5, -row - 0.55, 0.5)
+                ax.text(
+                    col + 0.2, -row - 0.24, str(day.day),
+                    fontsize=8, color=ink, ha="left", va="center", fontweight="bold",
+                )  # fmt: skip
+                continue
             ax.text(
                 col + 0.5, -row - 0.5, str(day.day),
                 fontsize=13, color=ink, ha="center", va="center",
@@ -117,6 +189,9 @@ def render_month(
         x += 1.6
     ax.text(6.92, y, "обведён сегодняшний день", fontsize=9, color=MUTED, va="center", ha="right")
 
+    # imshow сдвигает границы осей — возвращаем их после всех вклеек.
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
     buffer = io.BytesIO()
     fig.savefig(buffer, format="png", bbox_inches="tight", facecolor="white", pad_inches=0.25)
     plt.close(fig)

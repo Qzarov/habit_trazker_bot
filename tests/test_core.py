@@ -3,8 +3,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from habitbot.bot import parse_tz
-from habitbot.calendar_image import day_style, render_month, shift_month
+from habitbot.bot import clean_emoji, parse_tz
+from habitbot.calendar_image import can_draw, day_style, render_month, shift_month
 from habitbot.db import BAD, GOOD, Storage, streak
 from habitbot.reminders import is_due, parse_time, tick
 
@@ -93,6 +93,50 @@ def test_render_month_is_png() -> None:
         marks={date(2026, 10, 6), date(2026, 10, 8)}, created_on=date(2026, 10, 5), today=TODAY,
     )  # fmt: skip
     assert image.startswith(b"\x89PNG") and len(image) > 5000
+
+
+def test_render_month_with_emoji_differs() -> None:
+    kw = {
+        "name": "Зарядка", "is_bad": False, "year": 2026, "month": 10,
+        "marks": {date(2026, 10, 6)}, "created_on": date(2026, 10, 5), "today": TODAY,
+    }  # fmt: skip
+    plain = render_month(**kw)
+    with_emoji = render_month(emoji="💪", **kw)
+    assert with_emoji.startswith(b"\x89PNG")
+    if can_draw("💪"):  # на машине без шрифта эмодзи картинка остаётся прежней
+        assert with_emoji != plain
+
+
+def test_emoji_column_is_added_to_old_database(tmp_path) -> None:
+    import sqlite3
+
+    path = str(tmp_path / "old.db")
+    old = sqlite3.connect(path)
+    old.executescript(
+        "CREATE TABLE users (user_id INTEGER PRIMARY KEY, tz TEXT NOT NULL);"
+        "CREATE TABLE habits (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,"
+        " name TEXT NOT NULL, kind TEXT NOT NULL, remind_at TEXT, created_on TEXT NOT NULL,"
+        " archived INTEGER NOT NULL DEFAULT 0, last_reminded TEXT);"
+        "INSERT INTO users VALUES (1, 'UTC');"
+        "INSERT INTO habits (user_id, name, kind, created_on) VALUES (1, 'Старая', 'good', '2026-10-01');"
+    )
+    old.commit()
+    old.close()
+
+    storage = Storage(path)
+    [habit] = storage.list_habits(1)
+    assert (habit.name, habit.emoji, habit.icon) == ("Старая", None, "✅")
+    assert storage.set_emoji(1, habit.id, "💪")
+    assert storage.list_habits(1)[0].icon == "💪"
+
+
+@pytest.mark.parametrize(
+    ("text", "ok"),
+    [("💪", True), (" 🍬 ", True), ("привет", False), ("12", False), ("!", False), ("", False),
+     ("💪💪💪💪💪💪💪💪", False)],
+)  # fmt: skip
+def test_clean_emoji(text: str, ok: bool) -> None:
+    assert (clean_emoji(text) is not None) is ok
 
 
 def test_shift_month() -> None:

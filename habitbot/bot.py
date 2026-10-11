@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 import re
 from datetime import date, datetime, timedelta
 from html import escape
@@ -18,41 +19,91 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .calendar_image import MONTHS, render_month, shift_month
+from .calendar_image import MONTHS, can_draw, render_month, shift_month
 from .db import BAD, GOOD, Habit, Storage, streak
 from .reminders import parse_time, zone
 
 MAX_NAME = 60
 MAX_HABITS = 30
 
+# Кнопки постоянного меню под полем ввода: ими пользуются вместо команд.
+BTN_TODAY = "📋 Сегодня"
+BTN_HABITS = "📚 Привычки"
+BTN_ADD = "➕ Добавить"
+BTN_TZ = "🌍 Часовой пояс"
+BTN_HELP = "❓ Помощь"
+
+# Команды остаются запасным входом; в списке команд Telegram — только самое нужное.
 COMMANDS = [
-    BotCommand(command="today", description="Отметить привычки за сегодня"),
-    BotCommand(command="habits", description="Мои привычки и календарь"),
-    BotCommand(command="add", description="Добавить привычку"),
-    BotCommand(command="tz", description="Часовой пояс для напоминаний"),
+    BotCommand(command="start", description="Показать меню"),
     BotCommand(command="help", description="Как пользоваться"),
 ]
 
 HELP = (
-    "Я помогаю следить за привычками.\n\n"
+    "Я помогаю следить за привычками. Всё управление — кнопками внизу.\n\n"
     "• <b>Полезные</b> — отмечайте дни, когда сделали. Зелёный день в календаре — сделано.\n"
-    "• <b>Вредные</b> — отмечайте дни, когда сорвались. Красный день — было, зелёный — не было.\n\n"
-    "/add — добавить привычку\n"
-    "/today — отметить за сегодня\n"
-    "/habits — список, календарь, напоминания, удаление\n"
-    "/tz — часовой пояс (по нему приходят напоминания и считается «сегодня»)\n"
-    "/cancel — отменить ввод"
+    "• <b>Вредные</b> — отмечайте дни, когда сорвались. Красный день — было, зелёный — не было.\n"
+    "• У каждой привычки свой эмодзи — им помечены отмеченные дни на картинке.\n\n"
+    f"{BTN_TODAY} — отметить за сегодня\n"
+    f"{BTN_HABITS} — список, календарь, напоминания, эмодзи, удаление\n"
+    f"{BTN_ADD} — новая привычка\n"
+    f"{BTN_TZ} — по нему приходят напоминания и считается «сегодня»"
 )
+
+GOOD_EMOJI = ["💪", "🏃", "📚", "💧", "🧘", "🥗", "😴", "🦷", "🎯", "✍️", "🎸", "🧹"]
+BAD_EMOJI = ["🚬", "🍺", "🍬", "🍔", "📱", "☕", "🎮", "💸", "🤬", "🍕", "🍷", "🛋️"]
+QUICK_TIMES = ["07:00", "08:00", "09:00", "12:00", "18:00", "20:00", "21:00", "22:00"]
+# Смещения от UTC для кнопок выбора пояса.
+QUICK_ZONES = [
+    ("Калининград", 2), ("Москва", 3), ("Самара", 4), ("Екатеринбург", 5),
+    ("Омск", 6), ("Красноярск", 7), ("Иркутск", 8), ("Якутск", 9),
+    ("Владивосток", 10), ("Магадан", 11), ("Камчатка", 12),
+]  # fmt: skip
+
+
+def main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_TODAY), KeyboardButton(text=BTN_HABITS)],
+            [
+                KeyboardButton(text=BTN_ADD),
+                KeyboardButton(text=BTN_TZ),
+                KeyboardButton(text=BTN_HELP),
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def clean_emoji(text: str) -> str | None:
+    """Эмодзи от пользователя: короткая строка без букв и цифр, которую можно нарисовать."""
+    value = text.strip()
+    if not value or len(value) > 12 or any(ch.isalnum() or ch.isspace() for ch in value):
+        return None
+    if ord(max(value)) < 0x2190:  # обычная пунктуация — не эмодзи
+        return None
+    # Если на машине вовсе нет шрифта эмодзи, проверить отрисовку нечем — принимаем как есть.
+    if can_draw("✅") and not can_draw(value):
+        return None
+    return value
 
 
 class Add(StatesGroup):
     name = State()
     kind = State()
+    emoji = State()
     time = State()
+
+
+class EmojiEdit(StatesGroup):
+    value = State()
 
 
 class Remind(StatesGroup):
@@ -64,7 +115,7 @@ class Tz(StatesGroup):
 
 
 class HabitCb(CallbackData, prefix="h"):
-    action: str  # open | cal | rem | norem | del | delok | list
+    action: str  # open | cal | rem | norem | del | delok | list | emoji
     id: int = 0
 
 
@@ -79,10 +130,35 @@ class CalCb(CallbackData, prefix="c"):
     id: int
     year: int
     month: int
+    edit: int = 0  # 1 — под картинкой сетка дней для правки отметок
+
+
+class DayCb(CallbackData, prefix="d"):
+    id: int
+    year: int
+    month: int
+    day: int  # 0 — пустая клетка сетки, нажатие ничего не делает
 
 
 class KindCb(CallbackData, prefix="k"):
     kind: str
+
+
+class NavCb(CallbackData, prefix="n"):
+    action: str  # add | cancel
+
+
+class TimeCb(CallbackData, prefix="t"):
+    value: str  # ЧЧММ — двоеточие занято разделителем
+
+
+class TzCb(CallbackData, prefix="z"):
+    offset: int
+
+
+class EmojiCb(CallbackData, prefix="e"):
+    kind: str
+    idx: int
 
 
 def build_router(storage: Storage) -> Router:
@@ -94,14 +170,45 @@ def build_router(storage: Storage) -> Router:
     # --- тексты и клавиатуры ---
 
     def mark_label(habit: Habit, marked: bool) -> str:
+        title = f"{habit.icon} {habit.name}"
         if habit.is_bad:
-            return f"🚫 {habit.name} — было" if marked else f"▫️ {habit.name} — не было"
-        return f"✅ {habit.name} — сделано" if marked else f"▫️ {habit.name}"
+            return f"❗️ {title} — было" if marked else f"▫️ {title} — не было"
+        return f"✅ {title} — сделано" if marked else f"▫️ {title}"
+
+    def empty_view() -> tuple[str, InlineKeyboardMarkup]:
+        kb = InlineKeyboardBuilder()
+        kb.button(text=BTN_ADD, callback_data=NavCb(action="add"))
+        return "Привычек пока нет. Добавьте первую.", kb.as_markup()
+
+    def cancel_button(kb: InlineKeyboardBuilder) -> None:
+        kb.button(text="Отмена", callback_data=NavCb(action="cancel"))
+
+    def time_keyboard(*extra: tuple[str, CallbackData]) -> InlineKeyboardMarkup:
+        kb = InlineKeyboardBuilder()
+        for value in QUICK_TIMES:
+            kb.button(text=value, callback_data=TimeCb(value=value.replace(":", "")))
+        for text, data in extra:
+            kb.button(text=text, callback_data=data)
+        kb.adjust(4, 4, *([1] * len(extra)))
+        return kb.as_markup()
+
+    def emoji_keyboard(kind: str, back: CallbackData) -> InlineKeyboardMarkup:
+        kb = InlineKeyboardBuilder()
+        palette = BAD_EMOJI if kind == BAD else GOOD_EMOJI
+        for idx, emoji in enumerate(palette):
+            kb.button(text=emoji, callback_data=EmojiCb(kind=kind, idx=idx))
+        kb.button(text="Отмена", callback_data=back)
+        kb.adjust(6, 6, 1)
+        return kb.as_markup()
+
+    def palette_emoji(data: EmojiCb) -> str:
+        palette = BAD_EMOJI if data.kind == BAD else GOOD_EMOJI
+        return palette[data.idx % len(palette)]
 
     def today_view(user_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
         habits = storage.list_habits(user_id)
         if not habits:
-            return "Привычек пока нет. Добавьте первую: /add", None
+            return empty_view()
         day = today_of(user_id)
         kb = InlineKeyboardBuilder()
         for habit in habits:
@@ -120,15 +227,16 @@ def build_router(storage: Storage) -> Router:
     def list_view(user_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
         habits = storage.list_habits(user_id)
         if not habits:
-            return "Привычек пока нет. Добавьте первую: /add", None
+            return empty_view()
         kb = InlineKeyboardBuilder()
         for habit in habits:
             kb.button(
-                text=f"{habit.icon} {habit.name}",
+                text=f"{habit.icon} {habit.name}" + (" · вредная" if habit.is_bad else ""),
                 callback_data=HabitCb(action="open", id=habit.id),
             )
+        kb.button(text=BTN_ADD, callback_data=NavCb(action="add"))
         kb.adjust(1)
-        return "<b>Мои привычки</b>\n✅ полезные · 🚫 вредные", kb.as_markup()
+        return "<b>Мои привычки</b>\nНажмите на привычку, чтобы открыть её.", kb.as_markup()
 
     def streak_line(habit: Habit, day: date) -> str:
         days = streak(habit, storage.all_marks(habit.id), day)
@@ -139,10 +247,10 @@ def build_router(storage: Storage) -> Router:
     def card_view(habit: Habit) -> tuple[str, InlineKeyboardMarkup]:
         day = today_of(habit.user_id)
         yesterday = day - timedelta(days=1)
-        kind = "вредная 🚫" if habit.is_bad else "полезная ✅"
+        kind = "вредная" if habit.is_bad else "полезная"
         remind = f"каждый день в {habit.remind_at}" if habit.remind_at else "нет"
         text = (
-            f"<b>{escape(habit.name)}</b>\n"
+            f"{habit.icon} <b>{escape(habit.name)}</b>\n"
             f"Тип: {kind}\n"
             f"Напоминание: {remind}\n"
             f"{streak_line(habit, day)}"
@@ -161,19 +269,21 @@ def build_router(storage: Storage) -> Router:
             )
         kb.button(text="📅 Календарь", callback_data=HabitCb(action="cal", id=habit.id))
         kb.button(text="⏰ Напоминание", callback_data=HabitCb(action="rem", id=habit.id))
+        kb.button(text="🎨 Эмодзи", callback_data=HabitCb(action="emoji", id=habit.id))
         kb.button(text="🗑 Удалить", callback_data=HabitCb(action="del", id=habit.id))
         kb.button(text="← К списку", callback_data=HabitCb(action="list"))
-        kb.adjust(1, 1, 2, 2) if yesterday >= habit.created_on else kb.adjust(1, 2, 2)
+        kb.adjust(1, 1, 2, 2, 1) if yesterday >= habit.created_on else kb.adjust(1, 2, 2, 1)
         return text, kb.as_markup()
 
     def calendar_view(
-        habit: Habit, year: int, month: int
+        habit: Habit, year: int, month: int, edit: bool = False
     ) -> tuple[bytes, str, InlineKeyboardMarkup]:
         day = today_of(habit.user_id)
         marks = storage.all_marks(habit.id)
         image = render_month(
             name=habit.name,
             is_bad=habit.is_bad,
+            emoji=habit.icon,
             year=year,
             month=month,
             marks=marks,
@@ -183,63 +293,119 @@ def build_router(storage: Storage) -> Router:
         in_month = sum(1 for d in marks if (d.year, d.month) == (year, month))
         word = "Срывов" if habit.is_bad else "Отмечено дней"
         caption = (
-            f"<b>{escape(habit.name)}</b> · {MONTHS[month]} {year}\n"
+            f"{habit.icon} <b>{escape(habit.name)}</b> · {MONTHS[month]} {year}\n"
             f"{word} за месяц: <b>{in_month}</b>. {streak_line(habit, day)}"
         )
+        kb = InlineKeyboardBuilder()
+        rows: list[int] = []
+        if edit:
+            what = "было" if habit.is_bad else "сделано"
+            caption += f"\n\nНажмите на день, чтобы поставить или снять отметку «{what}»."
+            for week in calendar.Calendar(firstweekday=0).monthdatescalendar(year, month):
+                for d in week:
+                    # Править можно дни этого месяца от заведения привычки до сегодня.
+                    open_day = d.month == month and habit.created_on <= d <= day
+                    label = (
+                        (f"{habit.icon}{d.day}" if d in marks else str(d.day)) if open_day else " "
+                    )
+                    kb.button(
+                        text=label,
+                        callback_data=DayCb(
+                            id=habit.id, year=year, month=month, day=d.day if open_day else 0
+                        ),
+                    )
+                rows.append(7)
         prev_y, prev_m = shift_month(year, month, -1)
         next_y, next_m = shift_month(year, month, 1)
-        kb = InlineKeyboardBuilder()
+        nav = 0
         # Раньше месяца, когда привычку завели, и позже текущего листать незачем.
         if (prev_y, prev_m) >= (habit.created_on.year, habit.created_on.month):
-            kb.button(text="◀", callback_data=CalCb(id=habit.id, year=prev_y, month=prev_m))
+            kb.button(
+                text="◀", callback_data=CalCb(id=habit.id, year=prev_y, month=prev_m, edit=edit)
+            )
+            nav += 1
+        kb.button(
+            text="Готово" if edit else "✏️ Изменить отметки",
+            callback_data=CalCb(id=habit.id, year=year, month=month, edit=0 if edit else 1),
+        )
+        nav += 1
         if (next_y, next_m) <= (day.year, day.month):
-            kb.button(text="▶", callback_data=CalCb(id=habit.id, year=next_y, month=next_m))
+            kb.button(
+                text="▶", callback_data=CalCb(id=habit.id, year=next_y, month=next_m, edit=edit)
+            )
+            nav += 1
+        kb.adjust(*rows, nav)
         return image, caption, kb.as_markup()
 
-    # --- общие команды ---
+    # --- меню и общие команды ---
+    # Кнопки меню стоят первыми и не смотрят на состояние диалога: нажатие «Сегодня» посреди
+    # добавления привычки открывает список, а не становится её названием.
 
     @router.message(CommandStart())
     async def start(message: Message, state: FSMContext) -> None:
         await state.clear()
         storage.ensure_user(message.from_user.id)
-        await message.answer("Привет! " + HELP)
+        await message.answer("Привет! " + HELP, reply_markup=main_menu())
 
     @router.message(Command("help"))
-    async def help_(message: Message) -> None:
-        await message.answer(HELP)
+    @router.message(F.text == BTN_HELP)
+    async def help_(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer(HELP, reply_markup=main_menu())
 
     @router.message(Command("cancel"))
     async def cancel(message: Message, state: FSMContext) -> None:
         await state.clear()
-        await message.answer("Отменено.")
+        await message.answer("Отменено.", reply_markup=main_menu())
+
+    @router.callback_query(NavCb.filter(F.action == "cancel"))
+    async def cancel_button_pressed(query: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        await query.message.edit_text("Отменено.")
+        await query.answer()
 
     @router.message(Command("today"))
+    @router.message(F.text == BTN_TODAY)
     async def today(message: Message, state: FSMContext) -> None:
         await state.clear()
         text, kb = today_view(message.from_user.id)
         await message.answer(text, reply_markup=kb)
 
     @router.message(Command("habits"))
+    @router.message(F.text == BTN_HABITS)
     async def habits(message: Message, state: FSMContext) -> None:
         await state.clear()
         text, kb = list_view(message.from_user.id)
         await message.answer(text, reply_markup=kb)
 
-    # --- добавление ---
+    # --- добавление: название → тип → эмодзи → напоминание ---
+
+    async def begin_add(user_id: int, state: FSMContext) -> tuple[str, InlineKeyboardMarkup | None]:
+        await state.clear()
+        if len(storage.list_habits(user_id)) >= MAX_HABITS:
+            return f"Уже {MAX_HABITS} привычек — удалите лишние в разделе «{BTN_HABITS}».", None
+        await state.set_state(Add.name)
+        kb = InlineKeyboardBuilder()
+        cancel_button(kb)
+        return "Как называется привычка? Например: «Зарядка» или «Сладкое».", kb.as_markup()
 
     @router.message(Command("add"))
+    @router.message(F.text == BTN_ADD)
     async def add(message: Message, state: FSMContext) -> None:
-        if len(storage.list_habits(message.from_user.id)) >= MAX_HABITS:
-            await message.answer(f"Уже {MAX_HABITS} привычек — удалите лишние в /habits.")
-            return
-        await state.set_state(Add.name)
-        await message.answer("Как называется привычка? Например: «Зарядка» или «Сладкое».")
+        text, kb = await begin_add(message.from_user.id, state)
+        await message.answer(text, reply_markup=kb)
+
+    @router.callback_query(NavCb.filter(F.action == "add"))
+    async def add_from_button(query: CallbackQuery, state: FSMContext) -> None:
+        text, kb = await begin_add(query.from_user.id, state)
+        await query.message.answer(text, reply_markup=kb)
+        await query.answer()
 
     @router.message(Add.name, F.text)
     async def add_name(message: Message, state: FSMContext) -> None:
         name = " ".join(message.text.split())
         if not name or name.startswith("/"):
-            await message.answer("Пришлите название текстом или /cancel.")
+            await message.answer("Пришлите название текстом.")
             return
         if len(name) > MAX_NAME:
             await message.answer(f"Слишком длинно — до {MAX_NAME} символов.")
@@ -249,6 +415,8 @@ def build_router(storage: Storage) -> Router:
         kb = InlineKeyboardBuilder()
         kb.button(text="✅ Полезная", callback_data=KindCb(kind=GOOD))
         kb.button(text="🚫 Вредная", callback_data=KindCb(kind=BAD))
+        cancel_button(kb)
+        kb.adjust(2, 1)
         await message.answer(
             "Это полезная привычка или вредная?\n"
             "Полезную отмечают, когда сделали. Вредную — когда сорвались.",
@@ -258,27 +426,71 @@ def build_router(storage: Storage) -> Router:
     @router.callback_query(Add.kind, KindCb.filter())
     async def add_kind(query: CallbackQuery, callback_data: KindCb, state: FSMContext) -> None:
         await state.update_data(kind=callback_data.kind)
-        await state.set_state(Add.time)
-        kb = InlineKeyboardBuilder()
-        kb.button(text="Без напоминания", callback_data=HabitCb(action="norem"))
-        hint = (
-            "Во сколько спрашивать, как прошёл день? Например 21:30."
-            if callback_data.kind == BAD
-            else "Во сколько напоминать? Например 8:00."
+        await state.set_state(Add.emoji)
+        await query.message.edit_text(
+            "Выберите эмодзи — им привычка обозначается в списках и на календаре.\n"
+            "Можно прислать свой.",
+            reply_markup=emoji_keyboard(callback_data.kind, NavCb(action="cancel")),
         )
-        await query.message.edit_text(hint, reply_markup=kb.as_markup())
         await query.answer()
+
+    def time_question(kind: str) -> tuple[str, InlineKeyboardMarkup]:
+        hint = (
+            "Во сколько спрашивать, как прошёл день?" if kind == BAD else "Во сколько напоминать?"
+        )
+        kb = time_keyboard(
+            ("Без напоминания", HabitCb(action="norem")),
+            ("Отмена", NavCb(action="cancel")),
+        )
+        return f"{hint} Выберите время или пришлите своё, например 21:30.", kb
+
+    @router.callback_query(Add.emoji, EmojiCb.filter())
+    async def add_emoji(query: CallbackQuery, callback_data: EmojiCb, state: FSMContext) -> None:
+        await state.update_data(emoji=palette_emoji(callback_data))
+        await state.set_state(Add.time)
+        text, kb = time_question((await state.get_data())["kind"])
+        await query.message.edit_text(text, reply_markup=kb)
+        await query.answer()
+
+    @router.message(Add.emoji, F.text)
+    async def add_own_emoji(message: Message, state: FSMContext) -> None:
+        emoji = clean_emoji(message.text)
+        if emoji is None:
+            await message.answer(
+                "Это не похоже на эмодзи, который я смогу нарисовать. Пришлите другой или выберите из кнопок выше."
+            )
+            return
+        await state.update_data(emoji=emoji)
+        await state.set_state(Add.time)
+        text, kb = time_question((await state.get_data())["kind"])
+        await message.answer(text, reply_markup=kb)
 
     async def finish_add(user_id: int, state: FSMContext, remind_at: str | None) -> Habit:
         data = await state.get_data()
         await state.clear()
-        return storage.add_habit(user_id, data["name"], data["kind"], remind_at, today_of(user_id))
+        return storage.add_habit(
+            user_id, data["name"], data["kind"], remind_at, today_of(user_id), data.get("emoji")
+        )
+
+    def added_text(habit: Habit) -> str:
+        text, _ = card_view(habit)
+        if habit.remind_at:
+            tz = storage.get_tz(habit.user_id)
+            return f"Добавлено. Часовой пояс напоминаний: {tz}.\n\n{text}"
+        return f"Добавлено.\n\n{text}"
 
     @router.callback_query(Add.time, HabitCb.filter(F.action == "norem"))
     async def add_no_time(query: CallbackQuery, state: FSMContext) -> None:
         habit = await finish_add(query.from_user.id, state, None)
-        text, kb = card_view(habit)
-        await query.message.edit_text("Добавлено.\n\n" + text, reply_markup=kb)
+        await query.message.edit_text(added_text(habit), reply_markup=card_view(habit)[1])
+        await query.answer()
+
+    @router.callback_query(Add.time, TimeCb.filter())
+    async def add_quick_time(
+        query: CallbackQuery, callback_data: TimeCb, state: FSMContext
+    ) -> None:
+        habit = await finish_add(query.from_user.id, state, parse_time(callback_data.value))
+        await query.message.edit_text(added_text(habit), reply_markup=card_view(habit)[1])
         await query.answer()
 
     @router.message(Add.time, F.text)
@@ -288,12 +500,7 @@ def build_router(storage: Storage) -> Router:
             await message.answer("Не понял время. Пришлите в виде ЧЧ:ММ, например 21:30.")
             return
         habit = await finish_add(message.from_user.id, state, remind_at)
-        text, kb = card_view(habit)
-        tz = storage.get_tz(message.from_user.id)
-        await message.answer(
-            f"Добавлено. Часовой пояс напоминаний: {tz} (сменить — /tz).\n\n" + text,
-            reply_markup=kb,
-        )
+        await message.answer(added_text(habit), reply_markup=card_view(habit)[1])
 
     # --- карточка, календарь, удаление ---
 
@@ -310,7 +517,8 @@ def build_router(storage: Storage) -> Router:
         await query.answer()
 
     @router.callback_query(HabitCb.filter(F.action == "open"))
-    async def open_card(query: CallbackQuery, callback_data: HabitCb) -> None:
+    async def open_card(query: CallbackQuery, callback_data: HabitCb, state: FSMContext) -> None:
+        await state.clear()  # «Отмена» из выбора времени или эмодзи ведёт сюда же
         habit = await habit_or_alert(query, callback_data.id)
         if habit is None:
             return
@@ -335,7 +543,15 @@ def build_router(storage: Storage) -> Router:
         habit = await habit_or_alert(query, callback_data.id)
         if habit is None:
             return
-        image, caption, kb = calendar_view(habit, callback_data.year, callback_data.month)
+        await show_calendar(
+            query, habit, callback_data.year, callback_data.month, bool(callback_data.edit)
+        )
+        await query.answer()
+
+    async def show_calendar(
+        query: CallbackQuery, habit: Habit, year: int, month: int, edit: bool
+    ) -> None:
+        image, caption, kb = calendar_view(habit, year, month, edit)
         await query.message.edit_media(
             InputMediaPhoto(
                 media=BufferedInputFile(image, filename="calendar.png"),
@@ -344,7 +560,69 @@ def build_router(storage: Storage) -> Router:
             ),
             reply_markup=kb,
         )
+
+    @router.callback_query(DayCb.filter())
+    async def toggle_day(query: CallbackQuery, callback_data: DayCb) -> None:
+        if callback_data.day == 0:
+            await query.answer()
+            return
+        habit = await habit_or_alert(query, callback_data.id)
+        if habit is None:
+            return
+        day = date(callback_data.year, callback_data.month, callback_data.day)
+        # Кнопка могла устареть: проверяем границы заново.
+        if not habit.created_on <= day <= today_of(habit.user_id):
+            await query.answer("Этот день отметить нельзя.", show_alert=True)
+            return
+        on = storage.toggle_mark(habit.id, day)
+        await show_calendar(query, habit, callback_data.year, callback_data.month, True)
+        word = ("было" if habit.is_bad else "сделано") if on else "отметка снята"
+        await query.answer(f"{day.day} {MONTHS[day.month].lower()}: {word}")
+
+    # --- эмодзи ---
+
+    @router.callback_query(HabitCb.filter(F.action == "emoji"))
+    async def ask_emoji(query: CallbackQuery, callback_data: HabitCb, state: FSMContext) -> None:
+        habit = await habit_or_alert(query, callback_data.id)
+        if habit is None:
+            return
+        await state.set_state(EmojiEdit.value)
+        await state.update_data(habit_id=habit.id)
+        await query.message.edit_text(
+            f"Сейчас у «{escape(habit.name)}» эмодзи {habit.icon}. Выберите новый или пришлите свой.",
+            reply_markup=emoji_keyboard(habit.kind, HabitCb(action="open", id=habit.id)),
+        )
         await query.answer()
+
+    @router.callback_query(EmojiEdit.value, EmojiCb.filter())
+    async def pick_emoji(query: CallbackQuery, callback_data: EmojiCb, state: FSMContext) -> None:
+        data = await state.get_data()
+        await state.clear()
+        storage.set_emoji(query.from_user.id, data["habit_id"], palette_emoji(callback_data))
+        habit = await habit_or_alert(query, data["habit_id"])
+        if habit is None:
+            return
+        text, kb = card_view(habit)
+        await query.message.edit_text(text, reply_markup=kb)
+        await query.answer("Эмодзи изменён")
+
+    @router.message(EmojiEdit.value, F.text)
+    async def send_emoji(message: Message, state: FSMContext) -> None:
+        emoji = clean_emoji(message.text)
+        if emoji is None:
+            await message.answer(
+                "Это не похоже на эмодзи, который я смогу нарисовать. Пришлите другой или выберите из кнопок выше."
+            )
+            return
+        data = await state.get_data()
+        await state.clear()
+        storage.set_emoji(message.from_user.id, data["habit_id"], emoji)
+        habit = storage.get_habit(message.from_user.id, data["habit_id"])
+        if habit is None:
+            await message.answer("Этой привычки уже нет.")
+            return
+        text, kb = card_view(habit)
+        await message.answer(text, reply_markup=kb)
 
     @router.callback_query(HabitCb.filter(F.action == "del"))
     async def ask_delete(query: CallbackQuery, callback_data: HabitCb) -> None:
@@ -409,18 +687,31 @@ def build_router(storage: Storage) -> Router:
             return
         await state.set_state(Remind.time)
         await state.update_data(habit_id=habit.id)
-        kb = InlineKeyboardBuilder()
+        extra: list[tuple[str, CallbackData]] = []
         if habit.remind_at:
-            kb.button(text="Убрать напоминание", callback_data=HabitCb(action="norem", id=habit.id))
-        kb.button(text="Отмена", callback_data=HabitCb(action="open", id=habit.id))
-        kb.adjust(1)
+            extra.append(("Убрать напоминание", HabitCb(action="norem", id=habit.id)))
+        extra.append(("Отмена", HabitCb(action="open", id=habit.id)))
         current = f"Сейчас: {habit.remind_at}. " if habit.remind_at else ""
         await query.message.edit_text(
-            f"{current}Пришлите время напоминания для «{escape(habit.name)}» — ЧЧ:ММ, "
-            f"например 21:30.\nЧасовой пояс: {storage.get_tz(habit.user_id)}.",
-            reply_markup=kb.as_markup(),
+            f"{current}Во сколько напоминать про «{escape(habit.name)}»? Выберите время или "
+            f"пришлите своё, например 21:30.\nЧасовой пояс: {storage.get_tz(habit.user_id)}.",
+            reply_markup=time_keyboard(*extra),
         )
         await query.answer()
+
+    @router.callback_query(Remind.time, TimeCb.filter())
+    async def quick_reminder(
+        query: CallbackQuery, callback_data: TimeCb, state: FSMContext
+    ) -> None:
+        data = await state.get_data()
+        await state.clear()
+        storage.set_reminder(query.from_user.id, data["habit_id"], parse_time(callback_data.value))
+        habit = await habit_or_alert(query, data["habit_id"])
+        if habit is None:
+            return
+        text, kb = card_view(habit)
+        await query.message.edit_text(text, reply_markup=kb)
+        await query.answer(f"Напоминание в {habit.remind_at}")
 
     @router.callback_query(Remind.time, HabitCb.filter(F.action == "norem"))
     async def drop_reminder(
@@ -435,18 +726,11 @@ def build_router(storage: Storage) -> Router:
         await query.message.edit_text(text, reply_markup=kb)
         await query.answer("Напоминание убрано")
 
-    @router.callback_query(Remind.time, HabitCb.filter(F.action == "open"))
-    async def cancel_reminder(
-        query: CallbackQuery, callback_data: HabitCb, state: FSMContext
-    ) -> None:
-        await state.clear()
-        await open_card(query, callback_data)
-
     @router.message(Remind.time, F.text)
     async def set_reminder(message: Message, state: FSMContext) -> None:
         remind_at = parse_time(message.text)
         if remind_at is None:
-            await message.answer("Не понял время. Пришлите в виде ЧЧ:ММ или /cancel.")
+            await message.answer("Не понял время. Пришлите в виде ЧЧ:ММ, например 21:30.")
             return
         data = await state.get_data()
         await state.clear()
@@ -461,26 +745,52 @@ def build_router(storage: Storage) -> Router:
     # --- часовой пояс ---
 
     @router.message(Command("tz"))
+    @router.message(F.text == BTN_TZ)
     async def tz(message: Message, state: FSMContext) -> None:
         current = storage.get_tz(message.from_user.id)
         now = datetime.now(zone(current)).strftime("%H:%M")
         await state.set_state(Tz.value)
+        kb = InlineKeyboardBuilder()
+        for city, offset in QUICK_ZONES:
+            kb.button(text=f"{city} +{offset}", callback_data=TzCb(offset=offset))
+        cancel_button(kb)
+        kb.adjust(2)
         await message.answer(
             f"Сейчас пояс <b>{current}</b>, у вас {now}.\n"
-            "Чтобы сменить, пришлите название (Europe/Moscow, Asia/Yekaterinburg) "
-            "или смещение от UTC (+3, -5). Оставить как есть — /cancel."
+            "Выберите город или пришлите название пояса (Europe/Berlin) либо смещение "
+            "от UTC (+1, -5).",
+            reply_markup=kb.as_markup(),
         )
+
+    def tz_done(user_id: int, name: str) -> str:
+        storage.set_tz(user_id, name)
+        now = datetime.now(zone(name)).strftime("%H:%M")
+        return f"Готово: {name}, у вас сейчас {now}."
+
+    @router.callback_query(TzCb.filter())
+    async def pick_tz(query: CallbackQuery, callback_data: TzCb, state: FSMContext) -> None:
+        await state.clear()
+        name = parse_tz(f"+{callback_data.offset}")
+        if name is None:
+            await query.answer("Не знаю такой пояс.", show_alert=True)
+            return
+        await query.message.edit_text(tz_done(query.from_user.id, name))
+        await query.answer()
 
     @router.message(Tz.value, F.text)
     async def set_tz(message: Message, state: FSMContext) -> None:
         name = parse_tz(message.text)
         if name is None:
-            await message.answer("Не знаю такой пояс. Пример: Europe/Moscow или +3. Или /cancel.")
+            await message.answer("Не знаю такой пояс. Пример: Europe/Berlin или +3.")
             return
         await state.clear()
-        storage.set_tz(message.from_user.id, name)
-        now = datetime.now(zone(name)).strftime("%H:%M")
-        await message.answer(f"Готово: {name}, у вас сейчас {now}.")
+        await message.answer(tz_done(message.from_user.id, name))
+
+    # --- всё остальное ---
+
+    @router.message()
+    async def fallback(message: Message) -> None:
+        await message.answer("Не понял. Пользуйтесь кнопками меню внизу.", reply_markup=main_menu())
 
     return router
 
@@ -512,9 +822,9 @@ def reminder_message(habit: Habit) -> tuple[str, InlineKeyboardMarkup]:
     if habit.is_bad:
         kb.button(text="Не было 💪", callback_data=MarkCb(id=habit.id, back=0, src="r", on=0))
         kb.button(text="Было", callback_data=MarkCb(id=habit.id, back=0, src="r", on=1))
-        return f"⏰ <b>{escape(habit.name)}</b> — как сегодня?", kb.as_markup()
+        return f"⏰ {habit.icon} <b>{escape(habit.name)}</b> — как сегодня?", kb.as_markup()
     kb.button(text="✅ Сделано", callback_data=MarkCb(id=habit.id, back=0, src="r", on=1))
-    return f"⏰ Пора: <b>{escape(habit.name)}</b>", kb.as_markup()
+    return f"⏰ Пора: {habit.icon} <b>{escape(habit.name)}</b>", kb.as_markup()
 
 
 async def send_reminder(bot: Bot, habit: Habit) -> None:

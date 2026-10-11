@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS habits (
     user_id INTEGER NOT NULL REFERENCES users(user_id),
     name TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('good', 'bad')),
+    emoji TEXT,
     remind_at TEXT,
     created_on TEXT NOT NULL,
     archived INTEGER NOT NULL DEFAULT 0,
@@ -39,6 +40,7 @@ class Habit:
     user_id: int
     name: str
     kind: str
+    emoji: str | None
     remind_at: str | None
     created_on: date
     last_reminded: date | None
@@ -49,7 +51,8 @@ class Habit:
 
     @property
     def icon(self) -> str:
-        return "🚫" if self.is_bad else "✅"
+        """Эмодзи привычки; у заведённых до появления выбора — значок по типу."""
+        return self.emoji or ("🚫" if self.is_bad else "✅")
 
 
 def _habit(row: sqlite3.Row) -> Habit:
@@ -58,6 +61,7 @@ def _habit(row: sqlite3.Row) -> Habit:
         user_id=row["user_id"],
         name=row["name"],
         kind=row["kind"],
+        emoji=row["emoji"],
         remind_at=row["remind_at"],
         created_on=date.fromisoformat(row["created_on"]),
         last_reminded=date.fromisoformat(row["last_reminded"]) if row["last_reminded"] else None,
@@ -73,6 +77,10 @@ class Storage:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        # База, созданная до появления эмодзи: добавляем колонку на месте.
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(habits)")}
+        if "emoji" not in columns:
+            self.conn.execute("ALTER TABLE habits ADD COLUMN emoji TEXT")
         self.conn.commit()
 
     # --- пользователи ---
@@ -95,12 +103,19 @@ class Storage:
     # --- привычки ---
 
     def add_habit(
-        self, user_id: int, name: str, kind: str, remind_at: str | None, today: date
+        self,
+        user_id: int,
+        name: str,
+        kind: str,
+        remind_at: str | None,
+        today: date,
+        emoji: str | None = None,
     ) -> Habit:
         self.ensure_user(user_id)
         cur = self.conn.execute(
-            "INSERT INTO habits (user_id, name, kind, remind_at, created_on) VALUES (?, ?, ?, ?, ?)",
-            (user_id, name, kind, remind_at, today.isoformat()),
+            "INSERT INTO habits (user_id, name, kind, emoji, remind_at, created_on) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, name, kind, emoji, remind_at, today.isoformat()),
         )
         self.conn.commit()
         habit = self.get_habit(user_id, int(cur.lastrowid or 0))
@@ -124,6 +139,13 @@ class Storage:
     def delete_habit(self, user_id: int, habit_id: int) -> bool:
         cur = self.conn.execute(
             "UPDATE habits SET archived = 1 WHERE id = ? AND user_id = ?", (habit_id, user_id)
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def set_emoji(self, user_id: int, habit_id: int, emoji: str) -> bool:
+        cur = self.conn.execute(
+            "UPDATE habits SET emoji = ? WHERE id = ? AND user_id = ?", (emoji, habit_id, user_id)
         )
         self.conn.commit()
         return cur.rowcount > 0
