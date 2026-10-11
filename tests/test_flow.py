@@ -198,6 +198,8 @@ async def test_calendar_edit_any_past_day_and_delete(bot: Harness) -> None:
     photo = (await bot.press(find(buttons(card), "Календарь")))[0]
     assert type(photo).__name__ == "SendPhoto"
     assert rows(photo)[-1] == ["📣 Поделиться", "☰ Меню"]
+    # У вредной привычки в подписи — дни без срыва и лучшая серия.
+    assert "Без срывов: <b>1 дн.</b> Лучшая серия: <b>1 дн.</b>" in photo.caption
     edit = (await bot.press(find(buttons(photo), "Изменить отметки"), photo=True))[0]
     assert type(edit).__name__ == "EditMessageMedia"
     # На плитке — числа всех дней месяца, а не только дней после заведения привычки.

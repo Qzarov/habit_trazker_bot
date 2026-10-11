@@ -40,7 +40,7 @@ from .calendar_image import (
     render_overview,
     shift_month,
 )
-from .db import BAD, GOOD, Habit, Storage, streak
+from .db import BAD, GOOD, Habit, Storage, best_clean_streak, streak
 from .reminders import parse_time, zone
 
 log = logging.getLogger(__name__)
@@ -319,7 +319,8 @@ def build_router(storage: Storage) -> Router:
     def streak_line(habit: Habit, day: date) -> str:
         days = streak(habit, storage.all_marks(habit.id), day)
         if habit.is_bad:
-            return f"Без срывов: <b>{days} дн.</b>"
+            best = best_clean_streak(habit, storage.all_marks(habit.id), day)
+            return f"Без срывов: <b>{days} дн.</b> Лучшая серия: <b>{best} дн.</b>"
         return f"Серия: <b>{days} дн.</b> подряд"
 
     def card_view(habit: Habit) -> tuple[str, InlineKeyboardMarkup]:
@@ -362,6 +363,12 @@ def build_router(storage: Storage) -> Router:
             name=habit.name,
             is_bad=habit.is_bad,
             emoji=habit.icon,
+            stats=[
+                (streak(habit, marks, day), "без срыва сейчас"),
+                (best_clean_streak(habit, marks, day), "лучшая серия"),
+            ]
+            if habit.is_bad
+            else None,
             year=year,
             month=month,
             marks=marks,

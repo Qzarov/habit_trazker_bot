@@ -8,11 +8,12 @@ from habitbot.calendar_image import (
     OverviewHabit,
     can_draw,
     day_style,
+    days_word,
     render_month,
     render_overview,
     shift_month,
 )
-from habitbot.db import BAD, GOOD, Storage, streak
+from habitbot.db import BAD, GOOD, Storage, best_clean_streak, streak
 from habitbot.reminders import is_due, parse_time, tick
 
 TODAY = date(2026, 10, 11)
@@ -54,6 +55,44 @@ def test_bad_streak_counts_clean_days_since_creation(storage: Storage) -> None:
     assert streak(habit, set(), TODAY) == 7  # с 5-го по 11-е
     assert streak(habit, {date(2026, 10, 9)}, TODAY) == 2
     assert streak(habit, {TODAY}, TODAY) == 0
+
+
+def test_best_clean_streak(storage: Storage) -> None:
+    habit = storage.add_habit(1, "Сладкое", BAD, None, date(2026, 10, 1))
+    # Без срывов вовсе: лучшая серия — все дни с начала учёта, она же текущая.
+    assert best_clean_streak(habit, set(), TODAY) == 11
+    # Срывы 4-го и 9-го: отрезки 1–3 (3 дня), 5–8 (4 дня), 10–11 (2 дня).
+    marks = {date(2026, 10, 4), date(2026, 10, 9)}
+    assert best_clean_streak(habit, marks, TODAY) == 4
+    assert streak(habit, marks, TODAY) == 2
+    # Сорвался сегодня: текущая серия 0, лучшая — прошлый отрезок.
+    assert best_clean_streak(habit, {TODAY}, TODAY) == 10
+    # Срыв в первый же день и каждый день подряд.
+    every = {date(2026, 10, d) for d in range(1, 12)}
+    assert best_clean_streak(habit, every, TODAY) == 0
+    # Отметки вне периода учёта не считаются; лучшая серия не меньше текущей.
+    assert best_clean_streak(habit, {date(2026, 9, 20), date(2026, 10, 20)}, TODAY) == 11
+    for sample in (set(), marks, {TODAY}, every):
+        assert best_clean_streak(habit, sample, TODAY) >= streak(habit, sample, TODAY)
+
+
+@pytest.mark.parametrize(
+    ("count", "word"),
+    [(0, "дней"), (1, "день"), (2, "дня"), (4, "дня"), (5, "дней"), (11, "дней"), (12, "дней"),
+     (21, "день"), (22, "дня"), (25, "дней"), (101, "день"), (111, "дней")],
+)  # fmt: skip
+def test_days_word(count: int, word: str) -> None:
+    assert days_word(count) == word
+
+
+def test_render_month_with_stats_is_taller() -> None:
+    kw = {
+        "name": "Сладкое", "is_bad": True, "year": 2026, "month": 10,
+        "marks": {date(2026, 10, 6)}, "created_on": date(2026, 10, 1), "today": TODAY,
+    }  # fmt: skip
+    plain = render_month(**kw)
+    with_stats = render_month(stats=[(5, "без срыва сейчас"), (5, "лучшая серия")], **kw)
+    assert with_stats.startswith(b"\x89PNG") and len(with_stats) > len(plain)
 
 
 @pytest.mark.parametrize(

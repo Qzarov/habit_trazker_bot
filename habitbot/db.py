@@ -340,3 +340,17 @@ def streak(habit: Habit, marks: set[date], today: date) -> int:
         count += 1
         day -= timedelta(days=1)
     return count
+
+
+def best_clean_streak(habit: Habit, marks: set[date], today: date) -> int:
+    """Лучшая серия вредной привычки: самый длинный отрезок дней без срыва с начала учёта.
+
+    Считается по сегодняшний день включительно, поэтому текущая серия в неё входит и лучшая
+    никогда не меньше текущей.
+    """
+    best = 0
+    start = habit.created_on  # первый день очередного чистого отрезка
+    for slip in sorted(d for d in marks if habit.created_on <= d <= today):
+        best = max(best, (slip - start).days)
+        start = slip + timedelta(days=1)
+    return max(best, (today - start).days + 1, 0)

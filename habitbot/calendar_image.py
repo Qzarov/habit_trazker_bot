@@ -77,6 +77,17 @@ INK = "#1c1c1e"
 MUTED = "#8e8e93"
 
 
+#: Высота блока показателей под сеткой, в единицах сетки.
+STATS_HEIGHT = 1.25
+
+
+def days_word(count: int) -> str:
+    """«день», «дня» или «дней» по числу."""
+    if count % 100 in (11, 12, 13, 14):
+        return "дней"
+    return {1: "день", 2: "дня", 3: "дня", 4: "дня"}.get(count % 10, "дней")
+
+
 def day_style(day: date, *, is_bad: bool, marked: bool, created_on: date, today: date) -> str:
     """Что рисовать в клетке: `hit` — хорошо, `miss` — плохо, `idle` — не в счёт.
 
@@ -100,6 +111,7 @@ def render_month(
     name: str,
     is_bad: bool,
     emoji: str | None = None,
+    stats: list[tuple[int, str]] | None = None,
     year: int,
     month: int,
     marks: set[date],
@@ -109,9 +121,11 @@ def render_month(
     """PNG с сеткой месяца (неделя с понедельника).
 
     Отмеченные дни несут эмодзи привычки: у полезной это дни «сделано», у вредной — «было».
+    `stats` — показатели под сеткой, пары «число дней, подпись»: у вредной привычки это дни без
+    срыва и лучшая серия.
     """
     weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(year, month)
-    xlim, ylim = (0, 7), (-len(weeks) - 0.75, 1.55)
+    xlim, ylim = (0, 7), (-len(weeks) - 0.75 - (STATS_HEIGHT if stats else 0), 1.55)
     # Дюйм на единицу по обеим осям: клетки и эмодзи остаются квадратными.
     fig, ax = plt.subplots(figsize=(7, ylim[1] - ylim[0]), dpi=150)
     ax.set_aspect("equal")
@@ -189,6 +203,31 @@ def render_month(
         ax.text(x + 0.36, y, label, fontsize=10, color=MUTED, va="center")
         x += 1.6
     ax.text(6.92, y, "обведён сегодняшний день", fontsize=9, color=MUTED, va="center", ha="right")
+
+    if stats:
+        # Плашки с показателями: крупное число дней и подпись под ним.
+        top = y - 0.45
+        width = (7 - 0.16 - 0.2 * (len(stats) - 1)) / len(stats)
+        for index, (days, label) in enumerate(stats):
+            left = 0.08 + index * (width + 0.2)
+            ax.add_patch(
+                FancyBboxPatch(
+                    (left, top - 0.95),
+                    width,
+                    0.95,
+                    boxstyle="round,pad=0,rounding_size=0.16",
+                    facecolor=EMPTY,
+                    edgecolor="none",
+                )
+            )
+            ax.text(
+                left + width / 2, top - 0.36, f"{days} {days_word(days)}",
+                fontsize=20, fontweight="bold", color=INK, ha="center", va="center",
+            )  # fmt: skip
+            ax.text(
+                left + width / 2, top - 0.74, label,
+                fontsize=10, color=MUTED, ha="center", va="center",
+            )  # fmt: skip
 
     # imshow сдвигает границы осей — возвращаем их после всех вклеек.
     ax.set_xlim(*xlim)
