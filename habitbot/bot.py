@@ -45,6 +45,8 @@ MAX_NAME = 60
 MAX_HABITS = 30
 #: На сколько дней назад можно ставить отметки и листать календарь привычки.
 BACKFILL_DAYS = 366
+#: Сколько привычек перечислять в подписи при пересылке общего календаря (подпись ≤ 1024).
+SHARE_HABITS = 10
 
 # Подписи кнопок главного меню (инлайн-кнопки под сообщением).
 BTN_TODAY = "📋 Сегодня"
@@ -172,6 +174,12 @@ class NavCb(CallbackData, prefix="n"):
 
 
 class OverviewCb(CallbackData, prefix="o"):
+    year: int
+    month: int
+
+
+class ShareCb(CallbackData, prefix="s"):
+    id: int  # привычка; 0 — общий календарь
     year: int
     month: int
 
@@ -330,7 +338,7 @@ def build_router(storage: Storage) -> Router:
         return text, kb.as_markup()
 
     def calendar_view(
-        habit: Habit, year: int, month: int, edit: bool = False, share: str | None = None
+        habit: Habit, year: int, month: int, edit: bool = False
     ) -> tuple[bytes, str, InlineKeyboardMarkup]:
         day = today_of(habit.user_id)
         marks = storage.all_marks(habit.id)
@@ -393,14 +401,13 @@ def build_router(storage: Storage) -> Router:
                 text="▶", callback_data=CalCb(id=habit.id, year=next_y, month=next_m, edit=edit)
             )
             nav += 1
-        if share:
-            kb.button(text=BTN_SHARE, url=share)
+        kb.button(text=BTN_SHARE, callback_data=ShareCb(id=habit.id, year=year, month=month))
         menu_button(kb)
-        kb.adjust(*rows, nav, 2 if share else 1)
+        kb.adjust(*rows, nav, 2)
         return image, caption, kb.as_markup()
 
     def overview_view(
-        user_id: int, year: int, month: int, share: str | None = None
+        user_id: int, year: int, month: int
     ) -> tuple[bytes, str, InlineKeyboardMarkup]:
         """Общий календарь: все привычки пользователя на одной картинке месяца."""
         day = today_of(user_id)
@@ -439,10 +446,9 @@ def build_router(storage: Storage) -> Router:
                 text=f"{MONTHS[next_m]} ▶", callback_data=OverviewCb(year=next_y, month=next_m)
             )
             nav += 1
-        if share:
-            kb.button(text=BTN_SHARE, url=share)
+        kb.button(text=BTN_SHARE, callback_data=ShareCb(id=0, year=year, month=month))
         menu_button(kb)
-        kb.adjust(*([nav] if nav else []), 2 if share else 1)
+        kb.adjust(*([nav] if nav else []), 2)
         return image, caption, kb.as_markup()
 
     @router.callback_query(NavCb.filter(F.action == "cal"))
@@ -454,9 +460,7 @@ def build_router(storage: Storage) -> Router:
             await query.answer()
             return
         day = today_of(query.from_user.id)
-        image, caption, kb = overview_view(
-            query.from_user.id, day.year, day.month, await share_url(query.bot, query.from_user.id)
-        )
+        image, caption, kb = overview_view(query.from_user.id, day.year, day.month)
         await query.message.answer_photo(
             BufferedInputFile(image, filename="overview.png"), caption=caption, reply_markup=kb
         )
@@ -465,10 +469,7 @@ def build_router(storage: Storage) -> Router:
     @router.callback_query(OverviewCb.filter())
     async def turn_overview(query: CallbackQuery, callback_data: OverviewCb) -> None:
         image, caption, kb = overview_view(
-            query.from_user.id,
-            callback_data.year,
-            callback_data.month,
-            await share_url(query.bot, query.from_user.id),
+            query.from_user.id, callback_data.year, callback_data.month
         )
         await query.message.edit_media(
             InputMediaPhoto(
@@ -573,6 +574,57 @@ def build_router(storage: Storage) -> Router:
         else:
             await query.message.edit_text(text, reply_markup=kb)
         await query.answer("Отменено" if callback_data.action == "cancel" else None)
+
+    # --- поделиться календарём ---
+
+    def month_count(marks: set[date], year: int, month: int) -> int:
+        return sum(1 for d in marks if (d.year, d.month) == (year, month))
+
+    def share_stats(user_id: int, habit: Habit | None, year: int, month: int) -> str:
+        """Статистика для пересылаемого сообщения: по одной привычке или по всем."""
+        day = today_of(user_id)
+        if habit is not None:
+            count = month_count(storage.all_marks(habit.id), year, month)
+            word = "Срывов за месяц" if habit.is_bad else "Отмечено дней за месяц"
+            return (
+                f"{habit.icon} <b>{escape(habit.name)}</b> · {MONTHS[month]} {year}\n"
+                f"{word}: <b>{count}</b>\n"
+                f"{streak_line(habit, day)}"
+            )
+        lines = [f"<b>Мои привычки</b> · {MONTHS[month]} {year}"]
+        habits = storage.list_habits(user_id)
+        for h in habits[:SHARE_HABITS]:
+            count = month_count(storage.all_marks(h.id), year, month)
+            what = "срывов" if h.is_bad else "дней"
+            lines.append(f"{h.icon} {escape(h.name)} — {what}: <b>{count}</b>")
+        if len(habits) > SHARE_HABITS:
+            lines.append(f"…и ещё {len(habits) - SHARE_HABITS}")
+        return "\n".join(lines)
+
+    @router.callback_query(ShareCb.filter())
+    async def share_calendar(query: CallbackQuery, callback_data: ShareCb) -> None:
+        """Присылает календарь отдельным сообщением для пересылки: картинка, статистика,
+        приглашение. Ссылкой «поделиться» картинку приложить нельзя, поэтому — пересылка."""
+        user_id = query.from_user.id
+        habit = None
+        if callback_data.id:
+            habit = await habit_or_alert(query, callback_data.id)
+            if habit is None:
+                return
+        if not query.message.photo:
+            await query.answer("Откройте календарь заново.", show_alert=True)
+            return
+        caption = (
+            f"{share_stats(user_id, habit, callback_data.year, callback_data.month)}\n\n"
+            f"{await pretty_invitation(query.bot, user_id)}"
+        )
+        kb = InlineKeyboardBuilder()
+        kb.button(text="Открыть трекер привычек", url=await ref_link(query.bot, user_id))
+        # Та же картинка, что на экране: берём её по идентификатору, без повторной отрисовки.
+        await query.message.answer_photo(
+            query.message.photo[-1].file_id, caption=caption, reply_markup=kb.as_markup()
+        )
+        await query.answer("Перешлите это сообщение — картинка и ссылка сохранятся")
 
     # --- добавление: название → тип → эмодзи → напоминание ---
 
@@ -725,9 +777,7 @@ def build_router(storage: Storage) -> Router:
         if habit is None:
             return
         day = today_of(habit.user_id)
-        image, caption, kb = calendar_view(
-            habit, day.year, day.month, share=await share_url(query.bot, habit.user_id)
-        )
+        image, caption, kb = calendar_view(habit, day.year, day.month)
         await query.message.answer_photo(
             BufferedInputFile(image, filename="calendar.png"), caption=caption, reply_markup=kb
         )
@@ -746,9 +796,7 @@ def build_router(storage: Storage) -> Router:
     async def show_calendar(
         query: CallbackQuery, habit: Habit, year: int, month: int, edit: bool
     ) -> None:
-        image, caption, kb = calendar_view(
-            habit, year, month, edit, await share_url(query.bot, habit.user_id)
-        )
+        image, caption, kb = calendar_view(habit, year, month, edit)
         await query.message.edit_media(
             InputMediaPhoto(
                 media=BufferedInputFile(image, filename="calendar.png"),

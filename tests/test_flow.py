@@ -81,7 +81,7 @@ class Harness:
             date=datetime.now(),
             chat=CHAT,
             text=None if photo else "…",
-            photo=[PhotoSize(file_id="f", file_unique_id="u", width=1, height=1)]
+            photo=[PhotoSize(file_id="shown", file_unique_id="u", width=1, height=1)]
             if photo
             else None,
         )
@@ -349,3 +349,43 @@ async def test_overview_calendar_with_month_navigation(bot: Harness) -> None:
     nav, tail = rows(previous)
     assert nav[0].startswith("◀") and nav[-1].endswith("▶")
     assert tail == ["📣 Поделиться", "☰ Меню"]
+
+
+async def test_share_calendar_sends_picture_with_stats_and_invitation(bot: Harness) -> None:
+    card = await add(bot, "Зарядка", "Полезная", "💪")
+    await add(bot, "Сладкое", "Вредная", "🍬")
+    good, bad = bot.storage.list_habits(42)
+    today = datetime.now().date()
+    bot.storage.set_mark(good.id, today, True)
+    bot.storage.set_mark(bad.id, today, True)
+    link = "https://t.me/test_bot?start=ref42"
+
+    # Календарь одной привычки.
+    photo = (await bot.press(find(buttons(card), "Календарь")))[0]
+    shared = (await bot.press(buttons(photo)["📣 Поделиться"], photo=True))[0]
+    assert type(shared).__name__ == "SendPhoto" and shared.photo == "shown"
+    assert "💪 <b>Зарядка</b>" in shared.caption
+    assert "Отмечено дней за месяц: <b>1</b>" in shared.caption
+    assert "Серия: <b>1 дн.</b>" in shared.caption
+    assert f'<a href="{link}">Бот</a>' in shared.caption
+    assert rows(shared) == [["Открыть трекер привычек"]]
+    assert shared.reply_markup.inline_keyboard[0][0].url == link
+
+    # Общий календарь: строка на каждую привычку.
+    overview = (await bot.press("n:cal"))[0]
+    shared = (await bot.press(buttons(overview)["📣 Поделиться"], photo=True))[0]
+    assert "<b>Мои привычки</b>" in shared.caption
+    assert "💪 Зарядка — дней: <b>1</b>" in shared.caption
+    assert "🍬 Сладкое — срывов: <b>1</b>" in shared.caption
+    assert f'href="{link}"' in shared.caption
+
+
+async def test_share_caption_fits_telegram_limit(bot: Harness) -> None:
+    today = datetime.now().date()
+    for i in range(30):
+        name = f"Привычка с довольно длинным названием и уточнением, номер {i:02d}"[:60]
+        bot.storage.add_habit(42, name, "good", None, today, "💧")
+    overview = (await bot.press("n:cal"))[0]
+    shared = (await bot.press(buttons(overview)["📣 Поделиться"], photo=True))[0]
+    assert "…и ещё 20" in shared.caption
+    assert len(shared.caption) <= 1024
