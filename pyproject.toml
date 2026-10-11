@@ -1,0 +1,21 @@
+[project]
+name = "habit-bot"
+version = "0.1.0"
+description = "Телеграм-бот — трекер полезных и вредных привычек с напоминаниями и календарём"
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram>=3.13,<4",
+    "matplotlib>=3.8",
+    "tzdata",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["."]
