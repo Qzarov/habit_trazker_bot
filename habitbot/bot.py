@@ -19,6 +19,7 @@ from aiogram.types import (
     BotCommand,
     BufferedInputFile,
     CallbackQuery,
+    CopyTextButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
     Message,
@@ -507,13 +508,19 @@ def build_router(storage: Storage) -> Router:
 
     async def invite_view(bot: Bot, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         link = await ref_link(bot, user_id)
+        invitation = f"{SHARE_TEXT}\n{link}"
         kb = InlineKeyboardBuilder()
+        # Кнопки копирования кладут текст в буфер обмена без выделения руками.
+        kb.button(text="📋 Скопировать приглашение", copy_text=CopyTextButton(text=invitation))
+        kb.button(text="🔗 Скопировать ссылку", copy_text=CopyTextButton(text=link))
         kb.button(text=BTN_SHARE, url=await share_url(bot, user_id))
         menu_button(kb)
-        kb.adjust(2)
+        kb.adjust(1, 1, 2)
         text = (
-            "<b>Пригласить друга</b>\n"
-            "Ваша ссылка — по ней бот откроется сразу с приглашением от вас:\n"
+            "<b>Пригласить друга</b>\n\n"
+            "Готовое приглашение — нажмите на текст или на кнопку ниже, чтобы скопировать:\n"
+            f"<code>{escape(invitation)}</code>\n\n"
+            "Только ссылка:\n"
             f"<code>{link}</code>\n\n"
             f"Пришло по ссылке: <b>{storage.invited_count(user_id)}</b>"
         )

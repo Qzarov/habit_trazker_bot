@@ -237,8 +237,13 @@ async def test_invite_link_and_referral_count(bot: Harness) -> None:
     invite = (await bot.press("n:invite"))[0]
     assert "https://t.me/test_bot?start=ref42" in invite.text
     assert "Пришло по ссылке: <b>0</b>" in invite.text
-    share = invite.reply_markup.inline_keyboard[0][0]
-    assert share.text == "📣 Поделиться"
+    assert "Присоединяйся!\nhttps://t.me/test_bot?start=ref42</code>" in invite.text
+    copy_invite, copy_link = (row[0] for row in invite.reply_markup.inline_keyboard[:2])
+    assert copy_invite.copy_text.text.endswith("Присоединяйся!\nhttps://t.me/test_bot?start=ref42")
+    assert copy_link.copy_text.text == "https://t.me/test_bot?start=ref42"
+    assert len(copy_invite.copy_text.text) <= 256  # предел Telegram для кнопки копирования
+    assert rows(invite)[-1] == ["📣 Поделиться", "☰ Меню"]
+    share = invite.reply_markup.inline_keyboard[-1][0]
     assert share.url.startswith("https://t.me/share/url?url=https%3A%2F%2Ft.me%2Ftest_bot")
 
     friend = User(id=77, is_bot=False, first_name="Друг")
