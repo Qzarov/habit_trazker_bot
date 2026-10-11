@@ -16,7 +16,6 @@ from aiogram.types import CallbackQuery, Chat, Message, Update, User
 from habitbot.bot import (
     BTN_ADD,
     BTN_HABITS,
-    BTN_HELP,
     BTN_TODAY,
     BTN_TZ,
     build_router,
@@ -24,6 +23,7 @@ from habitbot.bot import (
 )
 from habitbot.db import Storage
 
+MENU = [BTN_TODAY, BTN_HABITS, "🗓 Календарь", BTN_ADD, BTN_TZ, "❓ Помощь"]
 USER = User(id=42, is_bot=False, first_name="Тест")
 CHAT = Chat(id=42, type="private")
 
@@ -109,14 +109,14 @@ async def test_start_shows_inline_menu_and_drops_old_keyboard(bot: Harness) -> N
     await bot.say("/start")
     greeting, menu = bot.session.calls[-2:]
     assert type(greeting.reply_markup).__name__ == "ReplyKeyboardRemove"
-    assert list(buttons(menu)) == [BTN_TODAY, BTN_HABITS, BTN_ADD, BTN_TZ, BTN_HELP]
+    assert list(buttons(menu)) == MENU
 
 
 async def test_every_screen_leads_back_to_menu(bot: Harness) -> None:
     for action in ("today", "habits", "help"):
         screen = (await bot.press(f"n:{action}"))[0]
         back = (await bot.press(find(buttons(screen), "Меню")))[0]
-        assert list(buttons(back)) == [BTN_TODAY, BTN_HABITS, BTN_ADD, BTN_TZ, BTN_HELP]
+        assert list(buttons(back)) == MENU
     # Произвольный текст вне диалога тоже приводит в меню.
     assert BTN_TODAY in buttons(await bot.say("что ты умеешь?"))
 
@@ -251,3 +251,27 @@ async def test_foreign_habit_button_is_rejected(bot: Harness) -> None:
     other = bot.storage.add_habit(7, "Чужая", "good", None, datetime.now().date())
     calls = await bot.press(f"h:open:{other.id}")
     assert isinstance(calls[0], AnswerCallbackQuery) and calls[0].show_alert
+
+
+async def test_overview_calendar_with_month_navigation(bot: Harness) -> None:
+    # Без привычек общий календарь предлагает добавить первую.
+    assert "Привычек пока нет" in (await bot.press("n:cal"))[0].text
+
+    await add(bot, "Зарядка", "Полезная", "💪")
+    await add(bot, "Сладкое", "Вредная", "🍬")
+    today = datetime.now().date()
+    # Привычки заведены два месяца назад — чтобы было куда листать.
+    bot.storage.conn.execute(
+        "UPDATE habits SET created_on = ?", ((today - timedelta(days=62)).isoformat(),)
+    )
+
+    photo = (await bot.press("n:cal"))[0]
+    assert type(photo).__name__ == "SendPhoto"
+    assert "Все привычки" in photo.caption
+    nav = buttons(photo)
+    assert len(nav) == 1 and next(iter(nav)).startswith("◀")  # вперёд текущего месяца нельзя
+
+    previous = (await bot.press(next(iter(nav.values()))))[0]
+    assert type(previous).__name__ == "EditMessageMedia"
+    labels = list(buttons(previous))
+    assert labels[0].startswith("◀") and labels[-1].endswith("▶")

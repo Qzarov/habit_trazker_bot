@@ -24,7 +24,14 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .calendar_image import MONTHS, can_draw, render_month, shift_month
+from .calendar_image import (
+    MONTHS,
+    OverviewHabit,
+    can_draw,
+    render_month,
+    render_overview,
+    shift_month,
+)
 from .db import BAD, GOOD, Habit, Storage, streak
 from .reminders import parse_time, zone
 
@@ -35,6 +42,7 @@ MAX_HABITS = 30
 BTN_TODAY = "📋 Сегодня"
 BTN_HABITS = "📚 Привычки"
 BTN_ADD = "➕ Добавить"
+BTN_CAL = "🗓 Календарь"
 BTN_TZ = "🌍 Часовой пояс"
 BTN_HELP = "❓ Помощь"
 BTN_MENU = "☰ Меню"
@@ -52,6 +60,7 @@ HELP = (
     "• У каждой привычки свой эмодзи — им помечены отмеченные дни на картинке.\n\n"
     f"{BTN_TODAY} — отметить за сегодня\n"
     f"{BTN_HABITS} — список, календарь, напоминания, эмодзи, удаление\n"
+    f"{BTN_CAL} — общая картинка месяца со всеми привычками\n"
     f"{BTN_ADD} — новая привычка\n"
     f"{BTN_TZ} — по нему приходят напоминания и считается «сегодня»"
 )
@@ -71,10 +80,11 @@ def main_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text=BTN_TODAY, callback_data=NavCb(action="today"))
     kb.button(text=BTN_HABITS, callback_data=NavCb(action="habits"))
+    kb.button(text=BTN_CAL, callback_data=NavCb(action="cal"))
     kb.button(text=BTN_ADD, callback_data=NavCb(action="add"))
     kb.button(text=BTN_TZ, callback_data=NavCb(action="tz"))
     kb.button(text=BTN_HELP, callback_data=NavCb(action="help"))
-    kb.adjust(2, 2, 1)
+    kb.adjust(2, 2, 2)
     return kb.as_markup()
 
 
@@ -144,7 +154,12 @@ class KindCb(CallbackData, prefix="k"):
 
 
 class NavCb(CallbackData, prefix="n"):
-    action: str  # menu | today | habits | add | tz | help | cancel
+    action: str  # menu | today | habits | cal | add | tz | help | cancel
+
+
+class OverviewCb(CallbackData, prefix="o"):
+    year: int
+    month: int
 
 
 class TimeCb(CallbackData, prefix="t"):
@@ -346,6 +361,75 @@ def build_router(storage: Storage) -> Router:
             nav += 1
         kb.adjust(*rows, nav)
         return image, caption, kb.as_markup()
+
+    def overview_view(
+        user_id: int, year: int, month: int
+    ) -> tuple[bytes, str, InlineKeyboardMarkup]:
+        """Общий календарь: все привычки пользователя на одной картинке месяца."""
+        day = today_of(user_id)
+        habits = storage.list_habits(user_id)
+        image = render_overview(
+            year=year,
+            month=month,
+            habits=[
+                OverviewHabit(
+                    name=h.name,
+                    emoji=h.icon,
+                    is_bad=h.is_bad,
+                    marks=frozenset(storage.all_marks(h.id)),
+                )
+                for h in habits
+            ],
+            today=day,
+        )
+        caption = (
+            f"<b>Все привычки</b> · {MONTHS[month]} {year}\n"
+            "Зелёный значок — полезная сделана, красный — вредная была."
+        )
+        first = min((h.created_on for h in habits), default=day)
+        prev_y, prev_m = shift_month(year, month, -1)
+        next_y, next_m = shift_month(year, month, 1)
+        kb = InlineKeyboardBuilder()
+        # Листаем от месяца самой ранней привычки до текущего.
+        if (prev_y, prev_m) >= (first.year, first.month):
+            kb.button(
+                text=f"◀ {MONTHS[prev_m]}", callback_data=OverviewCb(year=prev_y, month=prev_m)
+            )
+        if (next_y, next_m) <= (day.year, day.month):
+            kb.button(
+                text=f"{MONTHS[next_m]} ▶", callback_data=OverviewCb(year=next_y, month=next_m)
+            )
+        return image, caption, kb.as_markup()
+
+    @router.callback_query(NavCb.filter(F.action == "cal"))
+    async def open_overview(query: CallbackQuery, state: FSMContext) -> None:
+        await state.clear()
+        if not storage.list_habits(query.from_user.id):
+            text, kb = empty_view()
+            await query.message.edit_text(text, reply_markup=kb)
+            await query.answer()
+            return
+        day = today_of(query.from_user.id)
+        image, caption, kb = overview_view(query.from_user.id, day.year, day.month)
+        await query.message.answer_photo(
+            BufferedInputFile(image, filename="overview.png"), caption=caption, reply_markup=kb
+        )
+        await query.answer()
+
+    @router.callback_query(OverviewCb.filter())
+    async def turn_overview(query: CallbackQuery, callback_data: OverviewCb) -> None:
+        image, caption, kb = overview_view(
+            query.from_user.id, callback_data.year, callback_data.month
+        )
+        await query.message.edit_media(
+            InputMediaPhoto(
+                media=BufferedInputFile(image, filename="overview.png"),
+                caption=caption,
+                parse_mode="HTML",
+            ),
+            reply_markup=kb,
+        )
+        await query.answer()
 
     # --- меню и общие команды ---
 

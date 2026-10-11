@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import calendar
 import io
+from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
@@ -201,3 +202,106 @@ def render_month(
 def shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
     index = year * 12 + (month - 1) + delta
     return index // 12, index % 12 + 1
+
+
+@dataclass(frozen=True)
+class OverviewHabit:
+    """Привычка для общего календаря."""
+
+    name: str
+    emoji: str
+    is_bad: bool
+    marks: frozenset[date]
+
+
+#: Сколько значков помещается в клетке дня: три в ряд, два ряда.
+CELL_SLOTS = 6
+
+
+def render_overview(*, year: int, month: int, habits: list[OverviewHabit], today: date) -> bytes:
+    """Общий календарь месяца: на каждом дне — значки привычек, отмеченных в этот день.
+
+    Полезная привычка на зелёной плашке (сделано), вредная — на красной (было). Если отмеченных
+    в день больше, чем помещается, последняя ячейка показывает «+N». Под сеткой — легенда:
+    значок, название и число отмеченных дней за месяц.
+    """
+    weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(year, month)
+    legend_rows = (len(habits) + 1) // 2
+    bottom = -len(weeks) - 0.35 - 0.42 * max(legend_rows, 1) - 0.2
+    xlim, ylim = (0, 7), (bottom, 1.55)
+    fig, ax = plt.subplots(figsize=(7, ylim[1] - ylim[0]), dpi=150)
+    ax.set_aspect("equal")
+    ax.axis("off")
+
+    def chip(cx: float, cy: float, size: float, habit: OverviewHabit) -> None:
+        half = size / 2
+        ax.add_patch(
+            FancyBboxPatch(
+                (cx - half, cy - half),
+                size,
+                size,
+                boxstyle=f"round,pad=0,rounding_size={size * 0.25}",
+                facecolor=RED if habit.is_bad else GREEN,
+                edgecolor="none",
+                zorder=2,
+            )
+        )
+        glyph = emoji_image(habit.emoji)
+        if glyph is not None:
+            inner = half * 0.74
+            ax.imshow(glyph, extent=(cx - inner, cx + inner, cy - inner, cy + inner), zorder=3)
+
+    ax.text(0.05, 1.2, "Все привычки", fontsize=17, fontweight="bold", color=INK, va="center")
+    ax.text(0.05, 0.72, f"{MONTHS[month]} {year}", fontsize=11, color=MUTED, va="center")
+    for col, label in enumerate(WEEKDAYS):
+        ax.text(col + 0.5, 0.2, label, fontsize=10, color=MUTED, ha="center", va="center")
+
+    for row, week in enumerate(weeks):
+        for col, day in enumerate(week):
+            if day.month != month:
+                continue
+            ax.add_patch(
+                FancyBboxPatch(
+                    (col + 0.05, -row - 0.95),
+                    0.9,
+                    0.9,
+                    boxstyle="round,pad=0,rounding_size=0.14",
+                    facecolor=EMPTY,
+                    edgecolor=INK if day == today else "none",
+                    linewidth=1.8,
+                )
+            )
+            ax.text(
+                col + 0.14, -row - 0.2, str(day.day),
+                fontsize=8, color=MUTED if day > today else INK, ha="left", va="center",
+                fontweight="bold",
+            )  # fmt: skip
+            marked = [h for h in habits if day in h.marks]
+            shown = marked if len(marked) <= CELL_SLOTS else marked[: CELL_SLOTS - 1]
+            for slot, habit in enumerate(shown):
+                chip(col + 0.23 + 0.27 * (slot % 3), -row - 0.46 - 0.27 * (slot // 3), 0.24, habit)
+            if len(marked) > CELL_SLOTS:
+                slot = CELL_SLOTS - 1
+                ax.text(
+                    col + 0.23 + 0.27 * (slot % 3), -row - 0.46 - 0.27 * (slot // 3),
+                    f"+{len(marked) - len(shown)}",
+                    fontsize=7, color=INK, ha="center", va="center", fontweight="bold",
+                )  # fmt: skip
+
+    top = -len(weeks) - 0.35
+    if not habits:
+        ax.text(0.08, top - 0.2, "Привычек пока нет", fontsize=10, color=MUTED, va="center")
+    for index, habit in enumerate(habits):
+        x = 0.2 + 3.5 * (index % 2)
+        y = top - 0.2 - 0.42 * (index // 2)
+        chip(x, y, 0.3, habit)
+        days = sum(1 for d in habit.marks if (d.year, d.month) == (year, month))
+        name = habit.name if len(habit.name) <= 22 else habit.name[:21] + "…"
+        ax.text(x + 0.27, y, f"{name} · {days}", fontsize=10, color=INK, va="center")
+
+    ax.set_xlim(*xlim)
+    ax.set_ylim(*ylim)
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight", facecolor="white", pad_inches=0.25)
+    plt.close(fig)
+    return buffer.getvalue()

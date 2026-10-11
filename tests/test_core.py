@@ -4,7 +4,14 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from habitbot.bot import clean_emoji, parse_tz
-from habitbot.calendar_image import can_draw, day_style, render_month, shift_month
+from habitbot.calendar_image import (
+    OverviewHabit,
+    can_draw,
+    day_style,
+    render_month,
+    render_overview,
+    shift_month,
+)
 from habitbot.db import BAD, GOOD, Storage, streak
 from habitbot.reminders import is_due, parse_time, tick
 
@@ -137,6 +144,20 @@ def test_emoji_column_is_added_to_old_database(tmp_path) -> None:
 )  # fmt: skip
 def test_clean_emoji(text: str, ok: bool) -> None:
     assert (clean_emoji(text) is not None) is ok
+
+
+def test_render_overview() -> None:
+    habits = [
+        OverviewHabit("Зарядка", "💪", False, frozenset({date(2026, 10, 6), date(2026, 10, 8)})),
+        OverviewHabit("Сладкое", "🍬", True, frozenset({date(2026, 10, 8)})),
+    ]
+    image = render_overview(year=2026, month=10, habits=habits, today=TODAY)
+    empty = render_overview(year=2026, month=10, habits=[], today=TODAY)
+    assert image.startswith(b"\x89PNG") and empty.startswith(b"\x89PNG")
+    assert image != empty
+    # Больше значков, чем помещается в клетке, — не падает.
+    crowd = [OverviewHabit(f"П{i}", "💧", False, frozenset({date(2026, 10, 6)})) for i in range(12)]
+    assert render_overview(year=2026, month=10, habits=crowd, today=TODAY).startswith(b"\x89PNG")
 
 
 def test_shift_month() -> None:
