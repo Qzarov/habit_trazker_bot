@@ -10,8 +10,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.base import BaseSession
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.methods import AnswerCallbackQuery, TelegramMethod
-from aiogram.types import CallbackQuery, Chat, Message, Update, User
+from aiogram.methods import AnswerCallbackQuery, GetMe, TelegramMethod
+from aiogram.types import CallbackQuery, Chat, Message, PhotoSize, Update, User
 
 from habitbot.bot import (
     BTN_ADD,
@@ -23,7 +23,7 @@ from habitbot.bot import (
 )
 from habitbot.db import Storage
 
-MENU = [BTN_TODAY, BTN_HABITS, "🗓 Календарь", BTN_ADD, BTN_TZ, "❓ Помощь"]
+MENU = [BTN_TODAY, BTN_HABITS, "🗓 Календарь", BTN_ADD, BTN_TZ, "🤝 Пригласить", "❓ Помощь"]
 USER = User(id=42, is_bot=False, first_name="Тест")
 CHAT = Chat(id=42, type="private")
 
@@ -38,6 +38,8 @@ class FakeSession(BaseSession):
     async def close(self) -> None: ...
 
     async def make_request(self, bot, method, timeout=None):
+        if isinstance(method, GetMe):  # служебный запрос имени бота — не ответ пользователю
+            return User(id=99, is_bot=True, first_name="Бот", username="test_bot")
         self.calls.append(method)
         if isinstance(method, AnswerCallbackQuery):
             return True
@@ -58,26 +60,40 @@ class Harness:
         self.dp.include_router(build_router(self.storage))
         self.n = 0
 
-    async def say(self, text: str) -> TelegramMethod[Any]:
+    async def say(self, text: str, user: User = USER) -> TelegramMethod[Any]:
         self.n += 1
         message = Message(
-            message_id=self.n, date=datetime.now(), chat=CHAT, from_user=USER, text=text
+            message_id=self.n,
+            date=datetime.now(),
+            chat=Chat(id=user.id, type="private"),
+            from_user=user,
+            text=text,
         )
         await self.dp.feed_update(self.bot, Update(update_id=self.n, message=message))
         return self.session.calls[-1]
 
-    async def press(self, data: str) -> list[TelegramMethod[Any]]:
+    async def press(self, data: str, photo: bool = False) -> list[TelegramMethod[Any]]:
+        """Нажатие инлайн-кнопки; `photo` — кнопка под сообщением с картинкой."""
         self.n += 1
         before = len(self.session.calls)
+        source = Message(
+            message_id=500,
+            date=datetime.now(),
+            chat=CHAT,
+            text=None if photo else "…",
+            photo=[PhotoSize(file_id="f", file_unique_id="u", width=1, height=1)]
+            if photo
+            else None,
+        )
         query = CallbackQuery(
-            id=str(self.n),
-            from_user=USER,
-            chat_instance="x",
-            data=data,
-            message=Message(message_id=500, date=datetime.now(), chat=CHAT, text="…"),
+            id=str(self.n), from_user=USER, chat_instance="x", data=data, message=source
         )
         await self.dp.feed_update(self.bot, Update(update_id=self.n, callback_query=query))
         return self.session.calls[before:]
+
+
+def rows(call: TelegramMethod[Any]) -> list[list[str]]:
+    return [[b.text for b in row] for row in call.reply_markup.inline_keyboard]
 
 
 def buttons(call: TelegramMethod[Any]) -> dict[str, str]:
@@ -130,7 +146,7 @@ async def test_add_with_buttons_only_and_mark(bot: Harness) -> None:
 
     today = (await bot.press("n:today"))[0]
     calls = await bot.press(find(buttons(today), "Зарядка"))
-    assert "💪 Зарядка — сделано" in next(iter(buttons(calls[0])))
+    assert next(iter(buttons(calls[0]))) == "✅ 💪 Зарядка"
     assert len(bot.storage.all_marks(habit.id)) == 1
     await bot.press(find(buttons(today), "Зарядка"))
     assert bot.storage.all_marks(habit.id) == set()
@@ -165,39 +181,78 @@ async def test_cancel_button_returns_to_menu(bot: Harness) -> None:
     assert bot.storage.list_habits(42) == []
 
 
-async def test_bad_habit_calendar_edit_past_days_and_delete(bot: Harness) -> None:
+async def test_calendar_edit_any_past_day_and_delete(bot: Harness) -> None:
     card = await add(bot, "Сладкое", "Вредная", "🍬")
     assert "вредная" in card.text and "Напоминание: нет" in card.text
     [habit] = bot.storage.list_habits(42)
-    # Как будто привычку завели неделю назад — чтобы были прошедшие дни.
     today = datetime.now().date()
-    start = today - timedelta(days=7)
-    bot.storage.conn.execute("UPDATE habits SET created_on = ?", (start.isoformat(),))
+    assert habit.created_on == today
 
     photo = (await bot.press(find(buttons(card), "Календарь")))[0]
     assert type(photo).__name__ == "SendPhoto"
-    edit = (await bot.press(find(buttons(photo), "Изменить отметки")))[0]
+    assert rows(photo)[-1] == ["📣 Поделиться", "☰ Меню"]
+    edit = (await bot.press(find(buttons(photo), "Изменить отметки"), photo=True))[0]
     assert type(edit).__name__ == "EditMessageMedia"
+    # На плитке — числа всех дней месяца, а не только дней после заведения привычки.
+    numbers = [t for row in rows(edit)[:-2] for t in row if t.strip()]
+    assert numbers[0] == "1" and len(numbers) >= 28
 
-    # Отмечаем позавчера, проверяем подпись кнопки, потом снимаем.
-    day = today - timedelta(days=2)
+    # Привычка заведена сегодня, отмечаем день трёхдневной давности: учёт сдвигается на него.
+    day = today - timedelta(days=3)
     target = f"d:{habit.id}:{day.year}:{day.month}:{day.day}"
-    calls = await bot.press(target)
+    calls = await bot.press(target, photo=True)
     assert bot.storage.all_marks(habit.id) == {day}
+    assert bot.storage.list_habits(42)[0].created_on == day
     if day.month == today.month:
-        assert f"🍬{day.day}" in buttons(calls[0])
-    await bot.press(target)
+        assert f"🍬 {day.day}" in buttons(calls[0])
+    await bot.press(target, photo=True)
     assert bot.storage.all_marks(habit.id) == set()
 
-    # Будущий день и день до заведения привычки не отмечаются даже по готовой ссылке.
-    for bad in (today + timedelta(days=1), start - timedelta(days=1)):
-        calls = await bot.press(f"d:{habit.id}:{bad.year}:{bad.month}:{bad.day}")
+    # Будущий день и день больше года назад не отмечаются.
+    for bad in (today + timedelta(days=1), today - timedelta(days=400)):
+        calls = await bot.press(f"d:{habit.id}:{bad.year}:{bad.month}:{bad.day}", photo=True)
         assert calls[0].show_alert
     assert bot.storage.all_marks(habit.id) == set()
+
+    # «Меню» под картинкой присылает меню новым сообщением.
+    menu = (await bot.press("n:menu", photo=True))[0]
+    assert type(menu).__name__ == "SendMessage" and list(buttons(menu)) == MENU
 
     confirm = buttons((await bot.press(find(buttons(card), "Удалить")))[0])
     await bot.press(find(confirm, "Да, удалить"))
     assert bot.storage.list_habits(42) == []
+
+
+async def test_two_columns_and_add_next_to_menu(bot: Harness) -> None:
+    for name, emoji in (("Зарядка", "💪"), ("Чтение", "📚"), ("Вода", "💧")):
+        await add(bot, name, "Полезная", emoji)
+    listing = (await bot.press("n:habits"))[0]
+    assert rows(listing) == [["💪 Зарядка", "📚 Чтение"], ["💧 Вода"], [BTN_ADD, "☰ Меню"]]
+    today = (await bot.press("n:today"))[0]
+    assert rows(today) == [["▫️ 💪 Зарядка", "▫️ 📚 Чтение"], ["▫️ 💧 Вода"], ["☰ Меню"]]
+
+
+async def test_invite_link_and_referral_count(bot: Harness) -> None:
+    await bot.say("/start")
+    invite = (await bot.press("n:invite"))[0]
+    assert "https://t.me/test_bot?start=ref42" in invite.text
+    assert "Пришло по ссылке: <b>0</b>" in invite.text
+    share = invite.reply_markup.inline_keyboard[0][0]
+    assert share.text == "📣 Поделиться"
+    assert share.url.startswith("https://t.me/share/url?url=https%3A%2F%2Ft.me%2Ftest_bot")
+
+    friend = User(id=77, is_bot=False, first_name="Друг")
+    await bot.say("/start ref42", user=friend)
+    assert bot.storage.invited_count(42) == 1
+    notice = next(
+        c for c in bot.session.calls if "По вашей ссылке" in (getattr(c, "text", "") or "")
+    )
+    assert notice.chat_id == 42
+    # Повторный переход и приглашение самого себя не засчитываются.
+    await bot.say("/start ref42", user=friend)
+    await bot.say("/start ref42")
+    assert bot.storage.invited_count(42) == 1
+    assert "Пришло по ссылке: <b>1</b>" in (await bot.press("n:invite"))[0].text
 
 
 async def test_several_habits_and_reminder_answer(bot: Harness) -> None:
@@ -268,10 +323,12 @@ async def test_overview_calendar_with_month_navigation(bot: Harness) -> None:
     photo = (await bot.press("n:cal"))[0]
     assert type(photo).__name__ == "SendPhoto"
     assert "Все привычки" in photo.caption
-    nav = buttons(photo)
-    assert len(nav) == 1 and next(iter(nav)).startswith("◀")  # вперёд текущего месяца нельзя
+    nav, tail = rows(photo)
+    assert len(nav) == 1 and nav[0].startswith("◀")  # вперёд текущего месяца нельзя
+    assert tail == ["📣 Поделиться", "☰ Меню"]
 
-    previous = (await bot.press(next(iter(nav.values()))))[0]
+    previous = (await bot.press(buttons(photo)[nav[0]], photo=True))[0]
     assert type(previous).__name__ == "EditMessageMedia"
-    labels = list(buttons(previous))
-    assert labels[0].startswith("◀") and labels[-1].endswith("▶")
+    nav, tail = rows(previous)
+    assert nav[0].startswith("◀") and nav[-1].endswith("▶")
+    assert tail == ["📣 Поделиться", "☰ Меню"]

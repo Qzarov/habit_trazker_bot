@@ -12,7 +12,8 @@ BAD = "bad"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
-    tz TEXT NOT NULL
+    tz TEXT NOT NULL,
+    referred_by INTEGER
 );
 CREATE TABLE IF NOT EXISTS habits (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,6 +82,10 @@ class Storage:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(habits)")}
         if "emoji" not in columns:
             self.conn.execute("ALTER TABLE habits ADD COLUMN emoji TEXT")
+        # То же для приглашений.
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(users)")}
+        if "referred_by" not in columns:
+            self.conn.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
         self.conn.commit()
 
     # --- пользователи ---
@@ -90,6 +95,34 @@ class Storage:
             "INSERT OR IGNORE INTO users (user_id, tz) VALUES (?, ?)", (user_id, self.default_tz)
         )
         self.conn.commit()
+
+    def register(self, user_id: int, referred_by: int | None = None) -> bool:
+        """Заводит пользователя; `True` — если он новый и пришёл по действующему приглашению.
+
+        Приглашение засчитывается один раз, при первом входе: себе самому и от неизвестного
+        пользователя — нет, повторный переход по ссылке ничего не меняет.
+        """
+        known = self.conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if known:
+            return False
+        inviter = None
+        if referred_by is not None and referred_by != user_id:
+            row = self.conn.execute(
+                "SELECT 1 FROM users WHERE user_id = ?", (referred_by,)
+            ).fetchone()
+            inviter = referred_by if row else None
+        self.conn.execute(
+            "INSERT INTO users (user_id, tz, referred_by) VALUES (?, ?, ?)",
+            (user_id, self.default_tz, inviter),
+        )
+        self.conn.commit()
+        return inviter is not None
+
+    def invited_count(self, user_id: int) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM users WHERE referred_by = ?", (user_id,)
+        ).fetchone()
+        return int(row["n"])
 
     def get_tz(self, user_id: int) -> str:
         row = self.conn.execute("SELECT tz FROM users WHERE user_id = ?", (user_id,)).fetchone()
@@ -149,6 +182,14 @@ class Storage:
         )
         self.conn.commit()
         return cur.rowcount > 0
+
+    def backdate(self, habit_id: int, day: date) -> None:
+        """Сдвигает начало учёта назад, если отметили день раньше заведения привычки."""
+        self.conn.execute(
+            "UPDATE habits SET created_on = ? WHERE id = ? AND created_on > ?",
+            (day.isoformat(), habit_id, day.isoformat()),
+        )
+        self.conn.commit()
 
     def set_reminder(self, user_id: int, habit_id: int, remind_at: str | None) -> bool:
         cur = self.conn.execute(

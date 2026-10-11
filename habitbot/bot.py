@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import calendar
+import logging
 import re
 from datetime import date, datetime, timedelta
 from html import escape
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import Bot, F, Router
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -35,8 +37,12 @@ from .calendar_image import (
 from .db import BAD, GOOD, Habit, Storage, streak
 from .reminders import parse_time, zone
 
+log = logging.getLogger(__name__)
+
 MAX_NAME = 60
 MAX_HABITS = 30
+#: На сколько дней назад можно ставить отметки и листать календарь привычки.
+BACKFILL_DAYS = 366
 
 # Подписи кнопок главного меню (инлайн-кнопки под сообщением).
 BTN_TODAY = "📋 Сегодня"
@@ -46,6 +52,10 @@ BTN_CAL = "🗓 Календарь"
 BTN_TZ = "🌍 Часовой пояс"
 BTN_HELP = "❓ Помощь"
 BTN_MENU = "☰ Меню"
+BTN_INVITE = "🤝 Пригласить"
+BTN_SHARE = "📣 Поделиться"
+
+SHARE_TEXT = "Веду привычки в этом боте — отметки, напоминания и календарь. Присоединяйся!"
 
 # Команды остаются запасным входом; в списке команд Telegram — только самое нужное.
 COMMANDS = [
@@ -62,7 +72,8 @@ HELP = (
     f"{BTN_HABITS} — список, календарь, напоминания, эмодзи, удаление\n"
     f"{BTN_CAL} — общая картинка месяца со всеми привычками\n"
     f"{BTN_ADD} — новая привычка\n"
-    f"{BTN_TZ} — по нему приходят напоминания и считается «сегодня»"
+    f"{BTN_TZ} — по нему приходят напоминания и считается «сегодня»\n"
+    f"{BTN_INVITE} — ваша ссылка-приглашение для друзей"
 )
 
 GOOD_EMOJI = ["💪", "🏃", "📚", "💧", "🧘", "🥗", "😴", "🦷", "🎯", "✍️", "🎸", "🧹"]
@@ -83,8 +94,9 @@ def main_menu() -> InlineKeyboardMarkup:
     kb.button(text=BTN_CAL, callback_data=NavCb(action="cal"))
     kb.button(text=BTN_ADD, callback_data=NavCb(action="add"))
     kb.button(text=BTN_TZ, callback_data=NavCb(action="tz"))
+    kb.button(text=BTN_INVITE, callback_data=NavCb(action="invite"))
     kb.button(text=BTN_HELP, callback_data=NavCb(action="help"))
-    kb.adjust(2, 2, 2)
+    kb.adjust(2, 2, 2, 1)
     return kb.as_markup()
 
 
@@ -154,7 +166,7 @@ class KindCb(CallbackData, prefix="k"):
 
 
 class NavCb(CallbackData, prefix="n"):
-    action: str  # menu | today | habits | cal | add | tz | help | cancel
+    action: str  # menu | today | habits | cal | add | tz | invite | help | cancel
 
 
 class OverviewCb(CallbackData, prefix="o"):
@@ -184,16 +196,31 @@ def build_router(storage: Storage) -> Router:
     # --- тексты и клавиатуры ---
 
     def mark_label(habit: Habit, marked: bool) -> str:
+        # Коротко: кнопки стоят в две колонки, пояснение значков — в тексте над ними.
         title = f"{habit.icon} {habit.name}"
-        if habit.is_bad:
-            return f"❗️ {title} — было" if marked else f"▫️ {title} — не было"
-        return f"✅ {title} — сделано" if marked else f"▫️ {title}"
+        if not marked:
+            return f"▫️ {title}"
+        return f"❗️ {title}" if habit.is_bad else f"✅ {title}"
 
     def empty_view() -> tuple[str, InlineKeyboardMarkup]:
         kb = InlineKeyboardBuilder()
         kb.button(text=BTN_ADD, callback_data=NavCb(action="add"))
         menu_button(kb)
+        kb.adjust(2)
         return "Привычек пока нет. Добавьте первую.", kb.as_markup()
+
+    def two_columns(count: int, *tail: int) -> list[int]:
+        """Раскладка: `count` кнопок по две в ряд, затем ряды `tail`."""
+        return [2] * (count // 2) + [1] * (count % 2) + list(tail)
+
+    async def ref_link(bot: Bot, user_id: int) -> str:
+        me = await bot.me()
+        return f"https://t.me/{me.username}?start=ref{user_id}"
+
+    async def share_url(bot: Bot, user_id: int) -> str:
+        """Ссылка, открывающая в Telegram выбор чата с готовым текстом и приглашением."""
+        link = await ref_link(bot, user_id)
+        return f"https://t.me/share/url?url={quote(link, safe='')}&text={quote(SHARE_TEXT)}"
 
     def menu_button(kb: InlineKeyboardBuilder) -> None:
         kb.button(text=BTN_MENU, callback_data=NavCb(action="menu"))
@@ -240,11 +267,11 @@ def build_router(storage: Storage) -> Router:
                 callback_data=MarkCb(id=habit.id, back=0, src="t"),
             )
         menu_button(kb)
-        kb.adjust(1)
+        kb.adjust(*two_columns(len(habits), 1))
         text = (
             f"<b>Сегодня, {day.day} {MONTHS[day.month].lower()}</b>\n"
             "Нажмите на привычку, чтобы отметить или снять отметку.\n"
-            "У вредных отметка значит «было»."
+            "✅ — сделано, ❗️ — вредная была, ▫️ — без отметки."
         )
         return text, kb.as_markup()
 
@@ -260,7 +287,7 @@ def build_router(storage: Storage) -> Router:
             )
         kb.button(text=BTN_ADD, callback_data=NavCb(action="add"))
         menu_button(kb)
-        kb.adjust(1)
+        kb.adjust(*two_columns(len(habits), 2))
         return "<b>Мои привычки</b>\nНажмите на привычку, чтобы открыть её.", kb.as_markup()
 
     def streak_line(habit: Habit, day: date) -> str:
@@ -301,7 +328,7 @@ def build_router(storage: Storage) -> Router:
         return text, kb.as_markup()
 
     def calendar_view(
-        habit: Habit, year: int, month: int, edit: bool = False
+        habit: Habit, year: int, month: int, edit: bool = False, share: str | None = None
     ) -> tuple[bytes, str, InlineKeyboardMarkup]:
         day = today_of(habit.user_id)
         marks = storage.all_marks(habit.id)
@@ -325,26 +352,31 @@ def build_router(storage: Storage) -> Router:
         rows: list[int] = []
         if edit:
             what = "было" if habit.is_bad else "сделано"
-            caption += f"\n\nНажмите на день, чтобы поставить или снять отметку «{what}»."
+            caption += (
+                f"\n\nНажмите на число, чтобы поставить или снять отметку «{what}». "
+                "Можно отмечать и дни до того, как привычка появилась в боте."
+            )
             for week in calendar.Calendar(firstweekday=0).monthdatescalendar(year, month):
                 for d in week:
-                    # Править можно дни этого месяца от заведения привычки до сегодня.
-                    open_day = d.month == month and habit.created_on <= d <= day
+                    # Число на каждой клетке месяца; клетки соседних месяцев пустые. Можно ли
+                    # отметить день (будущий — нельзя), решает обработчик нажатия.
+                    in_month = d.month == month
                     label = (
-                        (f"{habit.icon}{d.day}" if d in marks else str(d.day)) if open_day else " "
+                        (f"{habit.icon} {d.day}" if d in marks else str(d.day)) if in_month else " "
                     )
                     kb.button(
                         text=label,
                         callback_data=DayCb(
-                            id=habit.id, year=year, month=month, day=d.day if open_day else 0
+                            id=habit.id, year=year, month=month, day=d.day if in_month else 0
                         ),
                     )
                 rows.append(7)
         prev_y, prev_m = shift_month(year, month, -1)
         next_y, next_m = shift_month(year, month, 1)
         nav = 0
-        # Раньше месяца, когда привычку завели, и позже текущего листать незачем.
-        if (prev_y, prev_m) >= (habit.created_on.year, habit.created_on.month):
+        # Назад — на год (на столько же можно ставить отметки), вперёд — до текущего месяца.
+        oldest = day - timedelta(days=BACKFILL_DAYS)
+        if (prev_y, prev_m) >= (oldest.year, oldest.month):
             kb.button(
                 text="◀", callback_data=CalCb(id=habit.id, year=prev_y, month=prev_m, edit=edit)
             )
@@ -359,11 +391,14 @@ def build_router(storage: Storage) -> Router:
                 text="▶", callback_data=CalCb(id=habit.id, year=next_y, month=next_m, edit=edit)
             )
             nav += 1
-        kb.adjust(*rows, nav)
+        if share:
+            kb.button(text=BTN_SHARE, url=share)
+        menu_button(kb)
+        kb.adjust(*rows, nav, 2 if share else 1)
         return image, caption, kb.as_markup()
 
     def overview_view(
-        user_id: int, year: int, month: int
+        user_id: int, year: int, month: int, share: str | None = None
     ) -> tuple[bytes, str, InlineKeyboardMarkup]:
         """Общий календарь: все привычки пользователя на одной картинке месяца."""
         day = today_of(user_id)
@@ -391,14 +426,21 @@ def build_router(storage: Storage) -> Router:
         next_y, next_m = shift_month(year, month, 1)
         kb = InlineKeyboardBuilder()
         # Листаем от месяца самой ранней привычки до текущего.
+        nav = 0
         if (prev_y, prev_m) >= (first.year, first.month):
             kb.button(
                 text=f"◀ {MONTHS[prev_m]}", callback_data=OverviewCb(year=prev_y, month=prev_m)
             )
+            nav += 1
         if (next_y, next_m) <= (day.year, day.month):
             kb.button(
                 text=f"{MONTHS[next_m]} ▶", callback_data=OverviewCb(year=next_y, month=next_m)
             )
+            nav += 1
+        if share:
+            kb.button(text=BTN_SHARE, url=share)
+        menu_button(kb)
+        kb.adjust(*([nav] if nav else []), 2 if share else 1)
         return image, caption, kb.as_markup()
 
     @router.callback_query(NavCb.filter(F.action == "cal"))
@@ -410,7 +452,9 @@ def build_router(storage: Storage) -> Router:
             await query.answer()
             return
         day = today_of(query.from_user.id)
-        image, caption, kb = overview_view(query.from_user.id, day.year, day.month)
+        image, caption, kb = overview_view(
+            query.from_user.id, day.year, day.month, await share_url(query.bot, query.from_user.id)
+        )
         await query.message.answer_photo(
             BufferedInputFile(image, filename="overview.png"), caption=caption, reply_markup=kb
         )
@@ -419,7 +463,10 @@ def build_router(storage: Storage) -> Router:
     @router.callback_query(OverviewCb.filter())
     async def turn_overview(query: CallbackQuery, callback_data: OverviewCb) -> None:
         image, caption, kb = overview_view(
-            query.from_user.id, callback_data.year, callback_data.month
+            query.from_user.id,
+            callback_data.year,
+            callback_data.month,
+            await share_url(query.bot, query.from_user.id),
         )
         await query.message.edit_media(
             InputMediaPhoto(
@@ -434,9 +481,21 @@ def build_router(storage: Storage) -> Router:
     # --- меню и общие команды ---
 
     @router.message(CommandStart())
-    async def start(message: Message, state: FSMContext) -> None:
+    async def start(message: Message, command: CommandObject, state: FSMContext) -> None:
         await state.clear()
-        storage.ensure_user(message.from_user.id)
+        user_id = message.from_user.id
+        inviter = None
+        if command.args and command.args.startswith("ref") and command.args[3:].isdigit():
+            inviter = int(command.args[3:])
+        if storage.register(user_id, inviter) and inviter is not None:
+            try:  # приглашавший мог заблокировать бота — это не повод падать
+                await message.bot.send_message(
+                    inviter,
+                    "🤝 По вашей ссылке пришёл новый человек. "
+                    f"Всего приглашено: {storage.invited_count(inviter)}.",
+                )
+            except Exception:
+                log.exception("inviter %s not notified", inviter)
         # Первым сообщением убираем клавиатуру прежних версий, если она осталась на экране.
         await message.answer("Привет! " + HELP, reply_markup=ReplyKeyboardRemove())
         await message.answer(MENU_TEXT, reply_markup=main_menu())
@@ -446,22 +505,43 @@ def build_router(storage: Storage) -> Router:
         await state.clear()
         await message.answer(HELP, reply_markup=only_menu())
 
+    async def invite_view(bot: Bot, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+        link = await ref_link(bot, user_id)
+        kb = InlineKeyboardBuilder()
+        kb.button(text=BTN_SHARE, url=await share_url(bot, user_id))
+        menu_button(kb)
+        kb.adjust(2)
+        text = (
+            "<b>Пригласить друга</b>\n"
+            "Ваша ссылка — по ней бот откроется сразу с приглашением от вас:\n"
+            f"<code>{link}</code>\n\n"
+            f"Пришло по ссылке: <b>{storage.invited_count(user_id)}</b>"
+        )
+        return text, kb.as_markup()
+
     @router.callback_query(
-        NavCb.filter(F.action.in_({"menu", "cancel", "today", "habits", "help"}))
+        NavCb.filter(F.action.in_({"menu", "cancel", "today", "habits", "help", "invite"}))
     )
     async def navigate(query: CallbackQuery, callback_data: NavCb, state: FSMContext) -> None:
         """Переходы по меню: тот же экран перерисовывается в том же сообщении."""
         await state.clear()
         user_id = query.from_user.id
+        storage.ensure_user(user_id)
         if callback_data.action == "today":
             text, kb = today_view(user_id)
         elif callback_data.action == "habits":
             text, kb = list_view(user_id)
         elif callback_data.action == "help":
             text, kb = HELP, only_menu()
+        elif callback_data.action == "invite":
+            text, kb = await invite_view(query.bot, user_id)
         else:
             text, kb = MENU_TEXT, main_menu()
-        await query.message.edit_text(text, reply_markup=kb)
+        if query.message.photo:
+            # Сообщение с календарём в текст не превратить — меню приходит новым сообщением.
+            await query.message.answer(text, reply_markup=kb)
+        else:
+            await query.message.edit_text(text, reply_markup=kb)
         await query.answer("Отменено" if callback_data.action == "cancel" else None)
 
     # --- добавление: название → тип → эмодзи → напоминание ---
@@ -615,7 +695,9 @@ def build_router(storage: Storage) -> Router:
         if habit is None:
             return
         day = today_of(habit.user_id)
-        image, caption, kb = calendar_view(habit, day.year, day.month)
+        image, caption, kb = calendar_view(
+            habit, day.year, day.month, share=await share_url(query.bot, habit.user_id)
+        )
         await query.message.answer_photo(
             BufferedInputFile(image, filename="calendar.png"), caption=caption, reply_markup=kb
         )
@@ -634,7 +716,9 @@ def build_router(storage: Storage) -> Router:
     async def show_calendar(
         query: CallbackQuery, habit: Habit, year: int, month: int, edit: bool
     ) -> None:
-        image, caption, kb = calendar_view(habit, year, month, edit)
+        image, caption, kb = calendar_view(
+            habit, year, month, edit, await share_url(query.bot, habit.user_id)
+        )
         await query.message.edit_media(
             InputMediaPhoto(
                 media=BufferedInputFile(image, filename="calendar.png"),
@@ -653,11 +737,19 @@ def build_router(storage: Storage) -> Router:
         if habit is None:
             return
         day = date(callback_data.year, callback_data.month, callback_data.day)
-        # Кнопка могла устареть: проверяем границы заново.
-        if not habit.created_on <= day <= today_of(habit.user_id):
-            await query.answer("Этот день отметить нельзя.", show_alert=True)
+        today = today_of(habit.user_id)
+        if day > today:
+            await query.answer("Этот день ещё не наступил.", show_alert=True)
+            return
+        if day < today - timedelta(days=BACKFILL_DAYS):
+            await query.answer("Отметки ставятся не дальше года назад.", show_alert=True)
             return
         on = storage.toggle_mark(habit.id, day)
+        if on:
+            # День раньше заведения привычки: учёт начинается с него, иначе календарь и серия
+            # эту отметку не увидят.
+            storage.backdate(habit.id, day)
+            habit = storage.get_habit(habit.user_id, habit.id) or habit
         await show_calendar(query, habit, callback_data.year, callback_data.month, True)
         word = ("было" if habit.is_bad else "сделано") if on else "отметка снята"
         await query.answer(f"{day.day} {MONTHS[day.month].lower()}: {word}")
