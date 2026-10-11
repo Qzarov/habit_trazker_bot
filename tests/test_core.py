@@ -2,6 +2,7 @@ from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 import pytest
+from conftest import TEST_DATABASE_URL, make_storage
 
 from habitbot.bot import clean_emoji, parse_tz
 from habitbot.calendar_image import (
@@ -21,7 +22,7 @@ TODAY = date(2026, 10, 11)
 
 @pytest.fixture
 def storage() -> Storage:
-    return Storage(":memory:")
+    return make_storage()
 
 
 def test_habits_are_private_to_owner(storage: Storage) -> None:
@@ -254,3 +255,41 @@ async def test_tick_respects_user_timezone(storage: Storage) -> None:
     assert await _run_tick(storage, datetime(2026, 10, 11, 3, 0, tzinfo=ZoneInfo("UTC"))) == [
         "Зарядка"
     ]
+
+
+@pytest.mark.skipif(not TEST_DATABASE_URL, reason="нужен TEST_DATABASE_URL с PostgreSQL")
+def test_migrate_sqlite_to_postgres(tmp_path) -> None:
+    from habitbot.migrate import migrate
+
+    path = str(tmp_path / "source.db")
+    source = Storage(path)
+    source.register(1)
+    source.register(5_000_000_000, referred_by=1)  # идентификатор больше 32 бит
+    source.touch_user(5_000_000_000, "Анна", "anna")
+    first = source.add_habit(1, "Зарядка", GOOD, "08:00", TODAY, "💪")
+    removed = source.add_habit(1, "Удалённая", BAD, None, TODAY)
+    second = source.add_habit(5_000_000_000, "Сладкое", BAD, None, TODAY, "🍬")
+    source.delete_habit(1, removed.id)
+    source.set_mark(first.id, TODAY, True)
+    source.set_mark(second.id, date(2026, 10, 9), True)
+    source.save_share("key", 1, "file", "подпись")
+    source.conn.close()
+
+    make_storage()  # очищает тестовую базу
+    assert migrate(path, TEST_DATABASE_URL) == {"users": 2, "habits": 3, "marks": 2, "shares": 1}
+
+    target = Storage(TEST_DATABASE_URL)
+    assert [(h.id, h.name, h.icon, h.remind_at) for h in target.list_habits(1)] == [
+        (first.id, "Зарядка", "💪", "08:00")
+    ]
+    assert target.all_marks(first.id) == {TODAY}
+    assert target.all_marks(second.id) == {date(2026, 10, 9)}
+    [invited] = target.invited(1)
+    assert (invited.user_id, invited.name, invited.username) == (5_000_000_000, "Анна", "anna")
+    assert target.get_share("key", 1) == ("file", "подпись")
+    # Новая привычка получает идентификатор после перенесённых, а не с единицы.
+    assert target.add_habit(1, "Новая", GOOD, None, TODAY).id > second.id
+
+    # В непустую базу повторный перенос не пишет.
+    with pytest.raises(SystemExit, match="уже есть данные"):
+        migrate(path, TEST_DATABASE_URL)

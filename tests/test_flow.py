@@ -12,6 +12,7 @@ from aiogram.client.session.base import BaseSession
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import AnswerCallbackQuery, AnswerInlineQuery, GetMe, TelegramMethod
 from aiogram.types import CallbackQuery, Chat, InlineQuery, Message, PhotoSize, Update, User
+from conftest import make_storage
 
 from habitbot.bot import (
     BTN_ADD,
@@ -21,7 +22,6 @@ from habitbot.bot import (
     build_router,
     reminder_message,
 )
-from habitbot.db import Storage
 
 MENU = [BTN_TODAY, BTN_HABITS, "🗓 Календарь", BTN_ADD, BTN_TZ, "🤝 Пригласить", "❓ Помощь"]
 USER = User(id=42, is_bot=False, first_name="Тест")
@@ -51,7 +51,7 @@ class FakeSession(BaseSession):
 
 class Harness:
     def __init__(self) -> None:
-        self.storage = Storage(":memory:")
+        self.storage = make_storage()
         self.session = FakeSession()
         self.bot = Bot(
             "42:TEST", session=self.session, default=DefaultBotProperties(parse_mode="HTML")

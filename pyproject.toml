@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "aiogram>=3.13,<4",
     "matplotlib>=3.8",
+    "psycopg[binary]>=3.2",
     "tzdata",
 ]
 
@@ -18,4 +19,4 @@ line-length = 100
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-pythonpath = ["."]
+pythonpath = [".", "tests"]

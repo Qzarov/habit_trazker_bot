@@ -36,9 +36,11 @@ async def main() -> None:
         raise SystemExit("Нет BOT_TOKEN: получите токен у @BotFather и положите в .env")
 
     storage = Storage(
-        os.environ.get("HABIT_DB", "habits.db"),
+        # Адрес PostgreSQL важнее файла SQLite: на сервере задан он, локально — файл.
+        os.environ.get("DATABASE_URL", "").strip() or os.environ.get("HABIT_DB", "habits.db"),
         default_tz=os.environ.get("DEFAULT_TZ", "Europe/Moscow"),
     )
+    logging.getLogger(__name__).info("storage: %s", "postgresql" if storage.postgres else "sqlite")
     bot = Bot(token, default=DefaultBotProperties(parse_mode="HTML", link_preview_is_disabled=True))
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(build_router(storage))
