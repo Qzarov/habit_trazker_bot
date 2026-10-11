@@ -10,8 +10,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.base import BaseSession
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.methods import AnswerCallbackQuery, GetMe, TelegramMethod
-from aiogram.types import CallbackQuery, Chat, Message, PhotoSize, Update, User
+from aiogram.methods import AnswerCallbackQuery, AnswerInlineQuery, GetMe, TelegramMethod
+from aiogram.types import CallbackQuery, Chat, InlineQuery, Message, PhotoSize, Update, User
 
 from habitbot.bot import (
     BTN_ADD,
@@ -41,7 +41,7 @@ class FakeSession(BaseSession):
         if isinstance(method, GetMe):  # служебный запрос имени бота — не ответ пользователю
             return User(id=99, is_bot=True, first_name="Бот", username="test_bot")
         self.calls.append(method)
-        if isinstance(method, AnswerCallbackQuery):
+        if isinstance(method, (AnswerCallbackQuery, AnswerInlineQuery)):
             return True
         return Message(message_id=1000 + len(self.calls), date=datetime.now(), chat=CHAT)
 
@@ -90,6 +90,13 @@ class Harness:
         )
         await self.dp.feed_update(self.bot, Update(update_id=self.n, callback_query=query))
         return self.session.calls[before:]
+
+
+async def inline(bot: Harness, text: str, user: User = USER) -> TelegramMethod[Any]:
+    bot.n += 1
+    query = InlineQuery(id=str(bot.n), from_user=user, query=text, offset="")
+    await bot.dp.feed_update(bot.bot, Update(update_id=bot.n, inline_query=query))
+    return bot.session.calls[-1]
 
 
 def rows(call: TelegramMethod[Any]) -> list[list[str]]:
@@ -389,3 +396,25 @@ async def test_share_caption_fits_telegram_limit(bot: Harness) -> None:
     shared = (await bot.press(buttons(overview)["📣 Поделиться"], photo=True))[0]
     assert "…и ещё 20" in shared.caption
     assert len(shared.caption) <= 1024
+
+
+async def test_share_via_chat_picker(bot: Harness) -> None:
+    card = await add(bot, "Зарядка", "Полезная", "💪")
+    photo = (await bot.press(find(buttons(card), "Календарь")))[0]
+    shared, hint, _ = await bot.press(buttons(photo)["📣 Поделиться"], photo=True)
+    assert type(shared).__name__ == "SendPhoto"  # сообщение для пересылки — без лишних кнопок
+    assert rows(shared) == [["Открыть трекер привычек"]]
+    assert rows(hint) == [["📤 Выбрать чат", "☰ Меню"]]
+    key = hint.reply_markup.inline_keyboard[0][0].switch_inline_query
+
+    answer = await inline(bot, key)
+    [result] = answer.results
+    assert (result.photo_file_id, result.caption) == ("shown", shared.caption)
+    assert result.reply_markup.inline_keyboard[0][0].url == "https://t.me/test_bot?start=ref42"
+    assert answer.is_personal and answer.cache_time == 0
+
+    # Чужой человек с тем же ключом и пустой запрос ничего не получают.
+    stranger = User(id=77, is_bot=False, first_name="Чужой")
+    assert (await inline(bot, key, user=stranger)).results == []
+    empty = await inline(bot, "")
+    assert empty.results == [] and empty.button.start_parameter == "inline"

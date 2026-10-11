@@ -5,6 +5,7 @@ from __future__ import annotations
 import calendar
 import logging
 import re
+import secrets
 from datetime import date, datetime, timedelta
 from html import escape
 from urllib.parse import quote
@@ -21,6 +22,9 @@ from aiogram.types import (
     CallbackQuery,
     CopyTextButton,
     InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultCachedPhoto,
+    InlineQueryResultsButton,
     InputMediaPhoto,
     LinkPreviewOptions,
     Message,
@@ -621,10 +625,54 @@ def build_router(storage: Storage) -> Router:
         kb = InlineKeyboardBuilder()
         kb.button(text="Открыть трекер привычек", url=await ref_link(query.bot, user_id))
         # Та же картинка, что на экране: берём её по идентификатору, без повторной отрисовки.
-        await query.message.answer_photo(
-            query.message.photo[-1].file_id, caption=caption, reply_markup=kb.as_markup()
+        file_id = query.message.photo[-1].file_id
+        await query.message.answer_photo(file_id, caption=caption, reply_markup=kb.as_markup())
+        # Второй способ — выбрать чат прямо из кнопки (встроенный режим бота). Кнопка отдельным
+        # сообщением, чтобы не уезжать вместе с пересылкой.
+        key = secrets.token_urlsafe(6)
+        storage.save_share(key, user_id, file_id, caption)
+        pick = InlineKeyboardBuilder()
+        pick.button(text="📤 Выбрать чат", switch_inline_query=key)
+        menu_button(pick)
+        await query.message.answer(
+            "Перешлите сообщение выше или выберите чат кнопкой — картинка, статистика и "
+            "ссылка сохранятся.",
+            reply_markup=pick.as_markup(),
         )
-        await query.answer("Перешлите это сообщение — картинка и ссылка сохранятся")
+        await query.answer()
+
+    @router.inline_query()
+    async def inline_share(inline: InlineQuery) -> None:
+        """Встроенный режим: по ключу из кнопки «Выбрать чат» отдаёт календарь владельцу."""
+        share = storage.get_share(inline.query.strip(), inline.from_user.id)
+        if share is None:
+            await inline.answer(
+                [],
+                cache_time=0,
+                is_personal=True,
+                button=InlineQueryResultsButton(
+                    text="Открыть трекер привычек", start_parameter="inline"
+                ),
+            )
+            return
+        file_id, caption = share
+        kb = InlineKeyboardBuilder()
+        kb.button(
+            text="Открыть трекер привычек", url=await ref_link(inline.bot, inline.from_user.id)
+        )
+        await inline.answer(
+            [
+                InlineQueryResultCachedPhoto(
+                    id=inline.query.strip(),
+                    photo_file_id=file_id,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=kb.as_markup(),
+                )
+            ],
+            cache_time=0,
+            is_personal=True,
+        )
 
     # --- добавление: название → тип → эмодзи → напоминание ---
 

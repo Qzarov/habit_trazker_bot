@@ -31,6 +31,12 @@ CREATE TABLE IF NOT EXISTS marks (
     day TEXT NOT NULL,
     PRIMARY KEY (habit_id, day)
 );
+CREATE TABLE IF NOT EXISTS shares (
+    key TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    file_id TEXT NOT NULL,
+    caption TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS ix_habits_user ON habits(user_id, archived);
 """
 
@@ -123,6 +129,22 @@ class Storage:
             "SELECT COUNT(*) AS n FROM users WHERE referred_by = ?", (user_id,)
         ).fetchone()
         return int(row["n"])
+
+    # --- календари, которыми делятся через выбор чата ---
+
+    def save_share(self, key: str, user_id: int, file_id: str, caption: str) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO shares (key, user_id, file_id, caption) VALUES (?, ?, ?, ?)",
+            (key, user_id, file_id, caption),
+        )
+        self.conn.commit()
+
+    def get_share(self, key: str, user_id: int) -> tuple[str, str] | None:
+        """Картинка и подпись по ключу — только своему владельцу."""
+        row = self.conn.execute(
+            "SELECT file_id, caption FROM shares WHERE key = ? AND user_id = ?", (key, user_id)
+        ).fetchone()
+        return (row["file_id"], row["caption"]) if row else None
 
     def get_tz(self, user_id: int) -> str:
         row = self.conn.execute("SELECT tz FROM users WHERE user_id = ?", (user_id,)).fetchone()
