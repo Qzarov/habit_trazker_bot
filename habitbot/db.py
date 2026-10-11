@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 GOOD = "good"
 BAD = "bad"
@@ -13,7 +13,10 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     tz TEXT NOT NULL,
-    referred_by INTEGER
+    referred_by INTEGER,
+    name TEXT,
+    username TEXT,
+    joined_at TEXT
 );
 CREATE TABLE IF NOT EXISTS habits (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +65,21 @@ class Habit:
         return self.emoji or ("🚫" if self.is_bad else "✅")
 
 
+@dataclass(frozen=True)
+class Invited:
+    """Человек, пришедший по приглашению."""
+
+    user_id: int
+    name: str | None
+    username: str | None
+    joined_at: datetime | None  # UTC; пусто у пришедших до того, как время стали записывать
+
+
+def _now() -> str:
+    """Текущий момент в UTC с точностью до секунды — для хранения."""
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
+
+
 def _habit(row: sqlite3.Row) -> Habit:
     return Habit(
         id=row["id"],
@@ -92,15 +110,47 @@ class Storage:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(users)")}
         if "referred_by" not in columns:
             self.conn.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+        # Имя, ник и время первого прихода: у пришедших раньше время остаётся пустым.
+        for column in ("name", "username", "joined_at"):
+            if column not in columns:
+                self.conn.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
         self.conn.commit()
 
     # --- пользователи ---
 
     def ensure_user(self, user_id: int) -> None:
         self.conn.execute(
-            "INSERT OR IGNORE INTO users (user_id, tz) VALUES (?, ?)", (user_id, self.default_tz)
+            "INSERT OR IGNORE INTO users (user_id, tz, joined_at) VALUES (?, ?, ?)",
+            (user_id, self.default_tz, _now()),
         )
         self.conn.commit()
+
+    def touch_user(self, user_id: int, name: str | None, username: str | None) -> None:
+        """Обновляет имя и ник уже известного пользователя; новых не заводит — иначе первый
+        вход по приглашению перестал бы считаться первым."""
+        self.conn.execute(
+            "UPDATE users SET name = ?, username = ? WHERE user_id = ? "
+            "AND (name IS NOT ? OR username IS NOT ?)",
+            (name, username, user_id, name, username),
+        )
+        self.conn.commit()
+
+    def invited(self, user_id: int) -> list[Invited]:
+        """Кто пришёл по ссылке пользователя, новые сверху."""
+        rows = self.conn.execute(
+            "SELECT user_id, name, username, joined_at FROM users WHERE referred_by = ? "
+            "ORDER BY joined_at DESC, user_id DESC",
+            (user_id,),
+        ).fetchall()
+        return [
+            Invited(
+                user_id=r["user_id"],
+                name=r["name"],
+                username=r["username"],
+                joined_at=datetime.fromisoformat(r["joined_at"]) if r["joined_at"] else None,
+            )
+            for r in rows
+        ]
 
     def register(self, user_id: int, referred_by: int | None = None) -> bool:
         """Заводит пользователя; `True` — если он новый и пришёл по действующему приглашению.
@@ -118,8 +168,8 @@ class Storage:
             ).fetchone()
             inviter = referred_by if row else None
         self.conn.execute(
-            "INSERT INTO users (user_id, tz, referred_by) VALUES (?, ?, ?)",
-            (user_id, self.default_tz, inviter),
+            "INSERT INTO users (user_id, tz, referred_by, joined_at) VALUES (?, ?, ?, ?)",
+            (user_id, self.default_tz, inviter, _now()),
         )
         self.conn.commit()
         return inviter is not None

@@ -204,6 +204,18 @@ class EmojiCb(CallbackData, prefix="e"):
 def build_router(storage: Storage) -> Router:
     router = Router()
 
+    async def remember_profile(handler, event, data):
+        """После обработки любого сообщения и нажатия освежает имя и ник пользователя."""
+        result = await handler(event, data)
+        user = getattr(event, "from_user", None)
+        if user is not None and not user.is_bot:
+            storage.touch_user(user.id, user.full_name, user.username)
+        return result
+
+    router.message.outer_middleware(remember_profile)
+    router.callback_query.outer_middleware(remember_profile)
+    router.inline_query.outer_middleware(remember_profile)
+
     def today_of(user_id: int) -> date:
         return datetime.now(zone(storage.get_tz(user_id))).date()
 

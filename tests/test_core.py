@@ -131,6 +131,12 @@ def test_emoji_column_is_added_to_old_database(tmp_path) -> None:
     old.close()
 
     storage = Storage(path)
+    # Старый пользователь остаётся, время его прихода неизвестно; новые колонки работают.
+    assert storage.register(2, referred_by=1) is True
+    [invited] = storage.invited(1)
+    assert invited.user_id == 2 and invited.joined_at is not None
+    storage.touch_user(2, "Анна", "anna")
+    assert storage.invited(1)[0].username == "anna"
     [habit] = storage.list_habits(1)
     assert (habit.name, habit.emoji, habit.icon) == ("Старая", None, "✅")
     assert storage.set_emoji(1, habit.id, "💪")

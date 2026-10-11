@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -418,3 +418,28 @@ async def test_share_via_chat_picker(bot: Harness) -> None:
     assert (await inline(bot, key, user=stranger)).results == []
     empty = await inline(bot, "")
     assert empty.results == [] and empty.button.start_parameter == "inline"
+
+
+async def test_name_username_and_join_time_are_saved(bot: Harness) -> None:
+    await bot.say("/start")
+    before = datetime.now(UTC).replace(microsecond=0)
+    friend = User(id=77, is_bot=False, first_name="Анна", last_name="Тестова", username="anna_t")
+    await bot.say("/start ref42", user=friend)
+
+    [invited] = bot.storage.invited(42)
+    assert (invited.user_id, invited.name, invited.username) == (77, "Анна Тестова", "anna_t")
+    assert before <= invited.joined_at <= datetime.now(UTC)
+
+    # Сменил имя и убрал ник — запись обновляется при следующем сообщении, время прихода прежнее.
+    renamed = User(id=77, is_bot=False, first_name="Аня")
+    await bot.say("привет", user=renamed)
+    [again] = bot.storage.invited(42)
+    assert (again.name, again.username, again.joined_at) == ("Аня", None, invited.joined_at)
+
+
+async def test_profile_update_does_not_spoil_first_visit_by_invitation(bot: Harness) -> None:
+    await bot.say("/start")
+    # Человек сначала пишет боту по ссылке — сохранение имени не должно завести его раньше времени.
+    friend = User(id=78, is_bot=False, first_name="Борис")
+    await bot.say("/start ref42", user=friend)
+    assert bot.storage.invited_count(42) == 1
