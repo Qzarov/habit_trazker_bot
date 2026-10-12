@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -35,12 +35,32 @@ def test_habits_are_private_to_owner(storage: Storage) -> None:
     assert storage.list_habits(1) == []
 
 
-def test_toggle_mark(storage: Storage) -> None:
+def test_answer_has_three_states(storage: Storage) -> None:
     habit = storage.add_habit(1, "Зарядка", GOOD, None, TODAY)
-    assert storage.toggle_mark(habit.id, TODAY) is True
+    assert storage.get_answer(habit.id, TODAY) is None  # нет данных
+    assert storage.cycle_answer(habit.id, TODAY) is True
     assert storage.is_marked(habit.id, TODAY)
-    assert storage.toggle_mark(habit.id, TODAY) is False
+    # «Нет» хранится отдельно от «нет данных», но отметкой не считается.
+    assert storage.cycle_answer(habit.id, TODAY) is False
+    assert storage.get_answer(habit.id, TODAY) is False
+    assert storage.all_answers(habit.id) == {TODAY: False}
     assert storage.all_marks(habit.id) == set()
+    assert storage.cycle_answer(habit.id, TODAY) is None
+    assert storage.all_answers(habit.id) == {}
+
+    storage.set_answer(habit.id, TODAY, False)
+    storage.set_answer(habit.id, TODAY, True)  # ответ за день один — новый заменяет прежний
+    assert storage.all_answers(habit.id) == {TODAY: True}
+
+
+def test_explicit_no_does_not_change_streaks(storage: Storage) -> None:
+    good = storage.add_habit(1, "Зарядка", GOOD, None, date(2026, 10, 1))
+    bad = storage.add_habit(1, "Сладкое", BAD, None, date(2026, 10, 1))
+    for habit in (good, bad):
+        storage.set_answer(habit.id, TODAY - timedelta(days=1), True)
+        storage.set_answer(habit.id, TODAY, False)
+    assert streak(good, storage.all_marks(good.id), TODAY) == 1  # по вчера, как без ответа
+    assert streak(bad, storage.all_marks(bad.id), TODAY) == 1
 
 
 def test_good_streak_survives_unmarked_today(storage: Storage) -> None:
@@ -89,7 +109,7 @@ def test_days_word(count: int, word: str) -> None:
 def test_render_month_with_stats_is_taller() -> None:
     kw = {
         "name": "Сладкое", "is_bad": True, "year": 2026, "month": 10,
-        "marks": {date(2026, 10, 6)}, "created_on": date(2026, 10, 1), "today": TODAY,
+        "answers": {date(2026, 10, 6): True}, "created_on": date(2026, 10, 1), "today": TODAY,
     }  # fmt: skip
     plain = render_month(**kw)
     with_stats = render_month(stats=[(5, "без срыва сейчас"), (5, "лучшая серия")], **kw)
@@ -122,22 +142,33 @@ def test_offset_zone_matches_moscow() -> None:
 def test_day_style() -> None:
     created = date(2026, 10, 5)
     kw = {"created_on": created, "today": TODAY}
-    assert day_style(date(2026, 10, 6), is_bad=False, marked=True, **kw) == "hit"
-    assert day_style(date(2026, 10, 6), is_bad=False, marked=False, **kw) == "miss"
-    assert day_style(date(2026, 10, 6), is_bad=True, marked=True, **kw) == "miss"
-    assert day_style(date(2026, 10, 6), is_bad=True, marked=False, **kw) == "hit"
-    # До заведения, в будущем и сегодня без отметки — не в счёт.
-    assert day_style(date(2026, 10, 4), is_bad=False, marked=False, **kw) == "idle"
-    assert day_style(date(2026, 10, 12), is_bad=True, marked=False, **kw) == "idle"
-    assert day_style(TODAY, is_bad=False, marked=False, **kw) == "idle"
-    assert day_style(TODAY, is_bad=True, marked=False, **kw) == "idle"
-    assert day_style(TODAY, is_bad=True, marked=True, **kw) == "miss"
+    assert day_style(date(2026, 10, 6), is_bad=False, answer=True, **kw) == "hit"
+    assert day_style(date(2026, 10, 6), is_bad=False, answer=False, **kw) == "miss"
+    assert day_style(date(2026, 10, 6), is_bad=True, answer=True, **kw) == "miss"
+    assert day_style(date(2026, 10, 6), is_bad=True, answer=False, **kw) == "hit"
+    # День без ответа — «нет данных»: ни хороший, ни плохой, у обоих типов привычек.
+    assert day_style(date(2026, 10, 6), is_bad=False, answer=None, **kw) == "unknown"
+    assert day_style(date(2026, 10, 6), is_bad=True, answer=None, **kw) == "unknown"
+    assert day_style(TODAY, is_bad=True, answer=None, **kw) == "unknown"
+    assert day_style(TODAY, is_bad=True, answer=True, **kw) == "miss"
+    assert day_style(TODAY, is_bad=True, answer=False, **kw) == "hit"
+    # До заведения и в будущем — не в счёт.
+    assert day_style(date(2026, 10, 4), is_bad=False, answer=None, **kw) == "idle"
+    assert day_style(date(2026, 10, 12), is_bad=True, answer=None, **kw) == "idle"
+
+
+def test_render_month_tells_no_from_no_data() -> None:
+    kw = {
+        "name": "Сладкое", "is_bad": True, "year": 2026, "month": 10,
+        "created_on": date(2026, 10, 1), "today": TODAY,
+    }  # fmt: skip
+    assert render_month(answers={}, **kw) != render_month(answers={date(2026, 10, 6): False}, **kw)
 
 
 def test_render_month_is_png() -> None:
     image = render_month(
         name="Зарядка", is_bad=False, year=2026, month=10,
-        marks={date(2026, 10, 6), date(2026, 10, 8)}, created_on=date(2026, 10, 5), today=TODAY,
+        answers={date(2026, 10, 6): True, date(2026, 10, 8): False}, created_on=date(2026, 10, 5), today=TODAY,
     )  # fmt: skip
     assert image.startswith(b"\x89PNG") and len(image) > 5000
 
@@ -145,13 +176,37 @@ def test_render_month_is_png() -> None:
 def test_render_month_with_emoji_differs() -> None:
     kw = {
         "name": "Зарядка", "is_bad": False, "year": 2026, "month": 10,
-        "marks": {date(2026, 10, 6)}, "created_on": date(2026, 10, 5), "today": TODAY,
+        "answers": {date(2026, 10, 6): True}, "created_on": date(2026, 10, 5), "today": TODAY,
     }  # fmt: skip
     plain = render_month(**kw)
     with_emoji = render_month(emoji="💪", **kw)
     assert with_emoji.startswith(b"\x89PNG")
     if can_draw("💪"):  # на машине без шрифта эмодзи картинка остаётся прежней
         assert with_emoji != plain
+
+
+def test_old_marks_become_yes_answers(tmp_path) -> None:
+    """База до появления ответа «нет»: колонка добавляется, прежние отметки — это «да»."""
+    import sqlite3
+
+    path = str(tmp_path / "old.db")
+    current = Storage(path)
+    habit = current.add_habit(1, "Зарядка", GOOD, None, TODAY)
+    current.conn.close()
+    old = sqlite3.connect(path)
+    old.executescript(
+        "DROP TABLE marks;"
+        "CREATE TABLE marks (habit_id INTEGER NOT NULL, day TEXT NOT NULL,"
+        " PRIMARY KEY (habit_id, day));"
+    )
+    old.execute("INSERT INTO marks VALUES (?, ?)", (habit.id, TODAY.isoformat()))
+    old.commit()
+    old.close()
+
+    storage = Storage(path)
+    assert storage.all_answers(habit.id) == {TODAY: True}
+    storage.set_answer(habit.id, TODAY, False)
+    assert Storage(path).all_answers(habit.id) == {TODAY: False}  # повторное открытие не портит
 
 
 def test_emoji_column_is_added_to_old_database(tmp_path) -> None:
@@ -239,7 +294,7 @@ async def test_tick_sends_once_and_skips_done(storage: Storage) -> None:
     storage.add_habit(1, "Сладкое", BAD, "08:00", TODAY)
     done = storage.add_habit(1, "Вода", GOOD, "08:00", TODAY)
     storage.add_habit(1, "Чтение", GOOD, "21:00", TODAY)
-    storage.set_mark(done.id, TODAY, True)
+    storage.set_answer(done.id, TODAY, True)
     now = datetime(2026, 10, 11, 5, 0, tzinfo=ZoneInfo("UTC"))  # 08:00 по Москве
 
     # Сделанную полезную не дёргаем; вредную спрашиваем всегда; «Чтению» ещё рано.
@@ -270,8 +325,8 @@ def test_migrate_sqlite_to_postgres(tmp_path) -> None:
     removed = source.add_habit(1, "Удалённая", BAD, None, TODAY)
     second = source.add_habit(5_000_000_000, "Сладкое", BAD, None, TODAY, "🍬")
     source.delete_habit(1, removed.id)
-    source.set_mark(first.id, TODAY, True)
-    source.set_mark(second.id, date(2026, 10, 9), True)
+    source.set_answer(first.id, TODAY, True)
+    source.set_answer(second.id, date(2026, 10, 9), False)
     source.save_share("key", 1, "file", "подпись")
     source.conn.close()
 
@@ -283,7 +338,7 @@ def test_migrate_sqlite_to_postgres(tmp_path) -> None:
         (first.id, "Зарядка", "💪", "08:00")
     ]
     assert target.all_marks(first.id) == {TODAY}
-    assert target.all_marks(second.id) == {date(2026, 10, 9)}
+    assert target.all_answers(second.id) == {date(2026, 10, 9): False}
     [invited] = target.invited(1)
     assert (invited.user_id, invited.name, invited.username) == (5_000_000_000, "Анна", "anna")
     assert target.get_share("key", 1) == ("file", "подпись")

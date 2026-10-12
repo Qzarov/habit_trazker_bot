@@ -1,9 +1,10 @@
-"""Календарь месяца картинкой: в какие дни привычка была, а в какие нет."""
+"""Календарь месяца картинкой: в какие дни привычка была, в какие нет, а где нет данных."""
 
 from __future__ import annotations
 
 import calendar
 import io
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
@@ -88,22 +89,21 @@ def days_word(count: int) -> str:
     return {1: "день", 2: "дня", 3: "дня", 4: "дня"}.get(count % 10, "дней")
 
 
-def day_style(day: date, *, is_bad: bool, marked: bool, created_on: date, today: date) -> str:
-    """Что рисовать в клетке: `hit` — хорошо, `miss` — плохо, `idle` — не в счёт.
+def day_style(
+    day: date, *, is_bad: bool, answer: bool | None, created_on: date, today: date
+) -> str:
+    """Что рисовать в клетке: `hit` — хорошо, `miss` — плохо, `unknown` — нет данных,
+    `idle` — не в счёт.
 
-    Полезная: отмечена → хорошо, прошедший день без отметки → плохо. Вредная наоборот:
-    отметка значит «сорвался». Дни до заведения привычки и будущие — не в счёт. Сегодняшний
-    день без отметки тоже не в счёт: он ещё не закончился.
+    `answer` — ответ за день: да, нет или `None`, если его не давали. Полезная: «да» — хорошо,
+    «нет» — плохо. Вредная наоборот: «да» значит «сорвался». День без ответа — «нет данных»,
+    он не выдаётся ни за хороший, ни за плохой. Дни до заведения привычки и будущие — не в счёт.
     """
     if day < created_on or day > today:
         return "idle"
-    if is_bad:
-        if marked:
-            return "miss"
-        return "idle" if day == today else "hit"
-    if marked:
-        return "hit"
-    return "idle" if day == today else "miss"
+    if answer is None:
+        return "unknown"
+    return "hit" if answer != is_bad else "miss"
 
 
 def render_month(
@@ -114,13 +114,15 @@ def render_month(
     stats: list[tuple[int, str]] | None = None,
     year: int,
     month: int,
-    marks: set[date],
+    answers: Mapping[date, bool],
     created_on: date,
     today: date,
 ) -> bytes:
     """PNG с сеткой месяца (неделя с понедельника).
 
-    Отмеченные дни несут эмодзи привычки: у полезной это дни «сделано», у вредной — «было».
+    `answers` — ответы по дням: да или нет; дня без ответа в нём нет, он рисуется пунктирной
+    рамкой «нет данных». Дни с ответом «да» несут эмодзи привычки: у полезной это «сделано»,
+    у вредной — «было».
     `stats` — показатели под сеткой, пары «число дней, подпись»: у вредной привычки это дни без
     срыва и лучшая серия.
     """
@@ -149,16 +151,25 @@ def render_month(
     colors = {
         "hit": (GREEN, "white"),
         "miss": (RED, "white") if is_bad else (GREY, INK),
+        "unknown": ("white", MUTED),
         "idle": (EMPTY, MUTED),
     }
+    #: Рамка клетки «нет данных».
+    dashed = {"edgecolor": MUTED, "linewidth": 1.0, "linestyle": (0, (3, 2.5))}
     for row, week in enumerate(weeks):
         for col, day in enumerate(week):
             if day.month != month:
                 continue
             style = day_style(
-                day, is_bad=is_bad, marked=day in marks, created_on=created_on, today=today
+                day, is_bad=is_bad, answer=answers.get(day), created_on=created_on, today=today
             )
             fill, ink = colors[style]
+            if day == today:
+                edge = {"edgecolor": INK, "linewidth": 1.8}
+            elif style == "unknown":
+                edge = dashed
+            else:
+                edge = {"edgecolor": "none"}
             ax.add_patch(
                 FancyBboxPatch(
                     (col + 0.08, -row - 0.92),
@@ -166,11 +177,10 @@ def render_month(
                     0.84,
                     boxstyle="round,pad=0,rounding_size=0.16",
                     facecolor=fill,
-                    edgecolor=INK if day == today else "none",
-                    linewidth=1.8,
+                    **edge,
                 )
             )
-            if glyph is not None and day in marks and style != "idle":
+            if glyph is not None and answers.get(day) and style != "idle":
                 # Отмеченный день: эмодзи по центру, число — мелко в углу.
                 stamp(col + 0.5, -row - 0.55, 0.5)
                 ax.text(
@@ -181,15 +191,20 @@ def render_month(
             ax.text(
                 col + 0.5, -row - 0.5, str(day.day),
                 fontsize=13, color=ink, ha="center", va="center",
-                fontweight="bold" if style != "idle" else "normal",
+                fontweight="bold" if style in ("hit", "miss") else "normal",
             )  # fmt: skip
 
-    legend = (
-        [(GREEN, "не было"), (RED, "было")] if is_bad else [(GREEN, "сделано"), (GREY, "пропуск")]
-    )
+    # Легенда: образец клетки и подпись. Образец — заливка и рамка, как у клеток сетки.
+    solid = {"edgecolor": "none"}
+    legend = [
+        (GREEN, solid, "не было" if is_bad else "сделано"),
+        (RED, solid, "было") if is_bad else (GREY, solid, "не сделано"),
+        ("white", dashed, "нет данных"),
+        ("white", {"edgecolor": INK, "linewidth": 1.4}, "сегодня"),
+    ]
     y = -len(weeks) - 0.4
     x = 0.08
-    for fill, label in legend:
+    for fill, edge, label in legend:
         ax.add_patch(
             FancyBboxPatch(
                 (x, y - 0.13),
@@ -197,12 +212,11 @@ def render_month(
                 0.26,
                 boxstyle="round,pad=0,rounding_size=0.06",
                 facecolor=fill,
-                edgecolor="none",
+                **edge,
             )
         )
         ax.text(x + 0.36, y, label, fontsize=10, color=MUTED, va="center")
-        x += 1.6
-    ax.text(6.92, y, "обведён сегодняшний день", fontsize=9, color=MUTED, va="center", ha="right")
+        x += 0.36 + 0.105 * len(label) + 0.3
 
     if stats:
         # Плашки с показателями: крупное число дней и подпись под ним.

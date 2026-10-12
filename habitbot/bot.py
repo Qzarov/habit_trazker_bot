@@ -73,8 +73,11 @@ COMMANDS = [
 
 HELP = (
     "Я помогаю следить за привычками. Всё управление — кнопками под сообщениями.\n\n"
-    "• <b>Полезные</b> — отмечайте дни, когда сделали. Зелёный день в календаре — сделано.\n"
-    "• <b>Вредные</b> — отмечайте дни, когда сорвались. Красный день — было, зелёный — не было.\n"
+    "• <b>Полезные</b> — отвечайте «сделано» или «не сделано». Зелёный день в календаре — "
+    "сделано, серый — не сделано.\n"
+    "• <b>Вредные</b> — отвечайте «было» или «не было». Красный день — было, зелёный — не было.\n"
+    "• День без ответа — «нет данных»: в календаре он в пунктирной рамке и не выдаётся ни за "
+    "«было», ни за «не было».\n"
     "• У каждой привычки свой эмодзи — им помечены отмеченные дни на картинке.\n\n"
     f"{BTN_TODAY} — отметить за сегодня\n"
     f"{BTN_HABITS} — список, календарь, напоминания, эмодзи, удаление\n"
@@ -109,6 +112,17 @@ def main_menu() -> InlineKeyboardMarkup:
 
 
 MENU_TEXT = "<b>Трекер привычек</b>\nЧто делаем?"
+
+#: Значок ответа «нет» на кнопках.
+NO_ICON = "➖"
+
+
+def answer_word(habit: Habit, answer: bool | None) -> str:
+    """Ответ за день словами: «было» и «не было» у вредной, «сделано» и «не сделано» у полезной."""
+    if answer is None:
+        return "нет данных"
+    word = "было" if habit.is_bad else "сделано"
+    return word if answer else f"не {word}"
 
 
 def clean_emoji(text: str) -> str | None:
@@ -152,7 +166,7 @@ class MarkCb(CallbackData, prefix="m"):
     id: int
     back: int  # 0 — сегодня, 1 — вчера
     src: str  # t — список «сегодня», c — карточка, r — напоминание
-    on: int = -1  # -1 — переключить, 0/1 — выставить
+    on: int = -1  # -1 — следующий ответ по кругу, 1 — «да», 0 — «нет»
 
 
 class CalCb(CallbackData, prefix="c"):
@@ -221,12 +235,14 @@ def build_router(storage: Storage) -> Router:
 
     # --- тексты и клавиатуры ---
 
-    def mark_label(habit: Habit, marked: bool) -> str:
+    def mark_label(habit: Habit, answer: bool | None) -> str:
         # Коротко: кнопки стоят в две колонки, пояснение значков — в тексте над ними.
         title = f"{habit.icon} {habit.name}"
-        if not marked:
+        if answer is None:
             return f"▫️ {title}"
-        return f"❗️ {title}" if habit.is_bad else f"✅ {title}"
+        if answer:
+            return f"❗️ {title}" if habit.is_bad else f"✅ {title}"
+        return f"💪 {title}" if habit.is_bad else f"{NO_ICON} {title}"
 
     def empty_view() -> tuple[str, InlineKeyboardMarkup]:
         kb = InlineKeyboardBuilder()
@@ -289,15 +305,16 @@ def build_router(storage: Storage) -> Router:
         kb = InlineKeyboardBuilder()
         for habit in habits:
             kb.button(
-                text=mark_label(habit, storage.is_marked(habit.id, day)),
+                text=mark_label(habit, storage.get_answer(habit.id, day)),
                 callback_data=MarkCb(id=habit.id, back=0, src="t"),
             )
         menu_button(kb)
         kb.adjust(*two_columns(len(habits), 1))
         text = (
             f"<b>Сегодня, {day.day} {MONTHS[day.month].lower()}</b>\n"
-            "Нажмите на привычку, чтобы отметить или снять отметку.\n"
-            "✅ — сделано, ❗️ — вредная была, ▫️ — без отметки."
+            "Нажатие меняет ответ по кругу: да → нет → нет данных.\n"
+            f"✅ — сделано, {NO_ICON} — не сделано, ❗️ — вредная была, 💪 — вредной не было, "
+            "▫️ — нет данных."
         )
         return text, kb.as_markup()
 
@@ -332,33 +349,37 @@ def build_router(storage: Storage) -> Router:
             f"{habit.icon} <b>{escape(habit.name)}</b>\n"
             f"Тип: {kind}\n"
             f"Напоминание: {remind}\n"
-            f"{streak_line(habit, day)}"
+            f"{streak_line(habit, day)}\n"
         )
-        word = "было" if habit.is_bad else "сделано"
-
-        def state(d: date) -> str:
-            return f"✔️ {word}" if storage.is_marked(habit.id, d) else f"▫️ не {word}"
-
         kb = InlineKeyboardBuilder()
-        kb.button(text=f"Сегодня: {state(day)}", callback_data=MarkCb(id=habit.id, back=0, src="c"))
+        days = [("Сегодня", day, 0)]
         if yesterday >= habit.created_on:
-            kb.button(
-                text=f"Вчера: {state(yesterday)}",
-                callback_data=MarkCb(id=habit.id, back=1, src="c"),
-            )
+            days.append(("Вчера", yesterday, 1))
+        for title, d, back in days:
+            # Ответ за день — словами в тексте и галочкой на кнопке. Кнопок две: «да» и «нет»;
+            # повторное нажатие на выбранную снимает ответ — снова «нет данных».
+            answer = storage.get_answer(habit.id, d)
+            text += f"\n{title}: <b>{answer_word(habit, answer)}</b>"
+            for value in (True, False):
+                kb.button(
+                    text=("✔️ " if answer is value else "")
+                    + f"{title}: {answer_word(habit, value)}",
+                    callback_data=MarkCb(id=habit.id, back=back, src="c", on=int(value)),
+                )
         kb.button(text="📅 Календарь", callback_data=HabitCb(action="cal", id=habit.id))
         kb.button(text="⏰ Напоминание", callback_data=HabitCb(action="rem", id=habit.id))
         kb.button(text="🎨 Эмодзи", callback_data=HabitCb(action="emoji", id=habit.id))
         kb.button(text="🗑 Удалить", callback_data=HabitCb(action="del", id=habit.id))
         kb.button(text="← К списку", callback_data=HabitCb(action="list"))
-        kb.adjust(1, 1, 2, 2, 1) if yesterday >= habit.created_on else kb.adjust(1, 2, 2, 1)
+        kb.adjust(*([2] * len(days)), 2, 2, 1)
         return text, kb.as_markup()
 
     def calendar_view(
         habit: Habit, year: int, month: int, edit: bool = False
     ) -> tuple[bytes, str, InlineKeyboardMarkup]:
         day = today_of(habit.user_id)
-        marks = storage.all_marks(habit.id)
+        answers = storage.all_answers(habit.id)
+        marks = {d for d, value in answers.items() if value}
         image = render_month(
             name=habit.name,
             is_bad=habit.is_bad,
@@ -371,36 +392,45 @@ def build_router(storage: Storage) -> Router:
             else None,
             year=year,
             month=month,
-            marks=marks,
+            answers=answers,
             created_on=habit.created_on,
             today=day,
         )
         in_month = sum(1 for d in marks if (d.year, d.month) == (year, month))
+        # Дни месяца, которые идут в счёт: с начала учёта привычки по сегодня.
+        tracked = [
+            d
+            for d in calendar.Calendar().itermonthdates(year, month)
+            if d.month == month and habit.created_on <= d <= day
+        ]
+        said_no = sum(1 for d in tracked if answers.get(d) is False)
         word = "Срывов" if habit.is_bad else "Отмечено дней"
         caption = (
             f"{habit.icon} <b>{escape(habit.name)}</b> · {MONTHS[month]} {year}\n"
-            f"{word} за месяц: <b>{in_month}</b>. {streak_line(habit, day)}"
+            f"{word} за месяц: <b>{in_month}</b>. {streak_line(habit, day)}\n"
+            f"{answer_word(habit, False).capitalize()}: <b>{said_no}</b> · "
+            f"нет данных: <b>{len(tracked) - in_month - said_no}</b>"
         )
         kb = InlineKeyboardBuilder()
         rows: list[int] = []
         if edit:
-            what = "было" if habit.is_bad else "сделано"
             caption += (
-                f"\n\nНажмите на число, чтобы поставить или снять отметку «{what}». "
+                f"\n\nНажатие на число меняет ответ по кругу: «{answer_word(habit, True)}» "
+                f"({habit.icon}) → «{answer_word(habit, False)}» ({NO_ICON}) → нет данных. "
                 "Можно отмечать и дни до того, как привычка появилась в боте."
             )
             for week in calendar.Calendar(firstweekday=0).monthdatescalendar(year, month):
                 for d in week:
                     # Число на каждой клетке месяца; клетки соседних месяцев пустые. Можно ли
                     # отметить день (будущий — нельзя), решает обработчик нажатия.
-                    in_month = d.month == month
-                    label = (
-                        (f"{habit.icon} {d.day}" if d in marks else str(d.day)) if in_month else " "
-                    )
+                    inside = d.month == month
+                    prefix = {True: f"{habit.icon} ", False: f"{NO_ICON} ", None: ""}[
+                        answers.get(d)
+                    ]
                     kb.button(
-                        text=label,
+                        text=f"{prefix}{d.day}" if inside else " ",
                         callback_data=DayCb(
-                            id=habit.id, year=year, month=month, day=d.day if in_month else 0
+                            id=habit.id, year=year, month=month, day=d.day if inside else 0
                         ),
                     )
                 rows.append(7)
@@ -899,15 +929,14 @@ def build_router(storage: Storage) -> Router:
         if day < today - timedelta(days=BACKFILL_DAYS):
             await query.answer("Отметки ставятся не дальше года назад.", show_alert=True)
             return
-        on = storage.toggle_mark(habit.id, day)
-        if on:
+        answer = storage.cycle_answer(habit.id, day)
+        if answer is not None:
             # День раньше заведения привычки: учёт начинается с него, иначе календарь и серия
-            # эту отметку не увидят.
+            # этот ответ не увидят.
             storage.backdate(habit.id, day)
             habit = storage.get_habit(habit.user_id, habit.id) or habit
         await show_calendar(query, habit, callback_data.year, callback_data.month, True)
-        word = ("было" if habit.is_bad else "сделано") if on else "отметка снята"
-        await query.answer(f"{day.day} {MONTHS[day.month].lower()}: {word}")
+        await query.answer(f"{day.day} {MONTHS[day.month].lower()}: {answer_word(habit, answer)}")
 
     # --- эмодзи ---
 
@@ -986,15 +1015,20 @@ def build_router(storage: Storage) -> Router:
             await query.answer("Привычки в этот день ещё не было.", show_alert=True)
             return
         if callback_data.on == -1:
-            on = storage.toggle_mark(habit.id, day)
+            on = storage.cycle_answer(habit.id, day)
         else:
             on = bool(callback_data.on)
-            storage.set_mark(habit.id, day, on)
+            # На карточке повторное нажатие на выбранный ответ снимает его.
+            if callback_data.src == "c" and storage.get_answer(habit.id, day) is on:
+                on = None
+            storage.set_answer(habit.id, day, on)
 
-        if habit.is_bad:
+        if on is None:
+            note = "Ответ снят: нет данных"
+        elif habit.is_bad:
             note = "Записал: было. Завтра новый день." if on else "Записал: не было 💪"
         else:
-            note = "Отмечено ✅" if on else "Отметка снята"
+            note = "Отмечено ✅" if on else "Записал: не сделано"
 
         if callback_data.src == "t":
             _, kb = today_view(query.from_user.id)
@@ -1155,6 +1189,7 @@ def reminder_message(habit: Habit) -> tuple[str, InlineKeyboardMarkup]:
         kb.button(text="Было", callback_data=MarkCb(id=habit.id, back=0, src="r", on=1))
         return f"⏰ {habit.icon} <b>{escape(habit.name)}</b> — как сегодня?", kb.as_markup()
     kb.button(text="✅ Сделано", callback_data=MarkCb(id=habit.id, back=0, src="r", on=1))
+    kb.button(text="Не сделано", callback_data=MarkCb(id=habit.id, back=0, src="r", on=0))
     return f"⏰ Пора: {habit.icon} <b>{escape(habit.name)}</b>", kb.as_markup()
 
 

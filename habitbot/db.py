@@ -1,4 +1,7 @@
-"""Хранилище: пользователи, привычки и отметки по дням.
+"""Хранилище: пользователи, привычки и ответы по дням.
+
+Ответ за день бывает трёх видов: «да» (полезная сделана, вредная была), «нет» и «нет данных».
+«Да» и «нет» — строки таблицы `marks` со значением 1 и 0; «нет данных» — отсутствие строки.
 
 Две базы на выбор: PostgreSQL (адрес `postgresql://…`) — для сервера, SQLite (путь к файлу) —
 для локального запуска и тестов. Запросы написаны на общем для обеих диалекте; различаются
@@ -38,6 +41,7 @@ CREATE TABLE IF NOT EXISTS habits (
 CREATE TABLE IF NOT EXISTS marks (
     habit_id INTEGER NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
     day TEXT NOT NULL,
+    value INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (habit_id, day)
 );
 CREATE TABLE IF NOT EXISTS shares (
@@ -75,6 +79,7 @@ CREATE TABLE IF NOT EXISTS habits (
 CREATE TABLE IF NOT EXISTS marks (
     habit_id BIGINT NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
     day TEXT NOT NULL,
+    value INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (habit_id, day)
 );
 CREATE TABLE IF NOT EXISTS shares (
@@ -185,6 +190,10 @@ class Storage:
         if self.postgres:
             self.conn = PgConnection(target)
             self.conn.execute(PG_SCHEMA)
+            # База, созданная до появления ответа «нет»: прежние отметки — это «да».
+            self.conn.execute(
+                "ALTER TABLE marks ADD COLUMN IF NOT EXISTS value INTEGER NOT NULL DEFAULT 1"
+            )
             return
         self.conn = sqlite3.connect(target)
         self.conn.row_factory = sqlite3.Row
@@ -202,6 +211,10 @@ class Storage:
         for column in ("name", "username", "joined_at"):
             if column not in columns:
                 self.conn.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
+        # Ответ «нет»: прежние отметки — это «да».
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(marks)")}
+        if "value" not in columns:
+            self.conn.execute("ALTER TABLE marks ADD COLUMN value INTEGER NOT NULL DEFAULT 1")
         self.conn.commit()
 
     # --- пользователи ---
@@ -374,42 +387,49 @@ class Storage:
         )
         self.conn.commit()
 
-    # --- отметки ---
+    # --- ответы по дням ---
 
-    def is_marked(self, habit_id: int, day: date) -> bool:
+    def get_answer(self, habit_id: int, day: date) -> bool | None:
+        """Ответ за день: `True` — да, `False` — нет, `None` — нет данных."""
         row = self.conn.execute(
-            "SELECT 1 FROM marks WHERE habit_id = ? AND day = ?", (habit_id, day.isoformat())
+            "SELECT value FROM marks WHERE habit_id = ? AND day = ?", (habit_id, day.isoformat())
         ).fetchone()
-        return row is not None
+        return bool(row["value"]) if row else None
 
-    def set_mark(self, habit_id: int, day: date, on: bool) -> None:
-        if on:
-            self.conn.execute(
-                "INSERT INTO marks (habit_id, day) VALUES (?, ?) ON CONFLICT DO NOTHING",
-                (habit_id, day.isoformat()),
-            )
-        else:
+    def set_answer(self, habit_id: int, day: date, value: bool | None) -> None:
+        """Записывает ответ за день; `None` стирает его — снова «нет данных»."""
+        if value is None:
             self.conn.execute(
                 "DELETE FROM marks WHERE habit_id = ? AND day = ?", (habit_id, day.isoformat())
             )
+        else:
+            self.conn.execute(
+                "INSERT INTO marks (habit_id, day, value) VALUES (?, ?, ?) "
+                "ON CONFLICT (habit_id, day) DO UPDATE SET value = excluded.value",
+                (habit_id, day.isoformat(), int(value)),
+            )
         self.conn.commit()
 
-    def toggle_mark(self, habit_id: int, day: date) -> bool:
-        """Переключает отметку дня, возвращает новое состояние."""
-        on = not self.is_marked(habit_id, day)
-        self.set_mark(habit_id, day, on)
-        return on
+    def cycle_answer(self, habit_id: int, day: date) -> bool | None:
+        """Следующий ответ по кругу: нет данных → да → нет → нет данных; возвращает новый."""
+        value = {None: True, True: False, False: None}[self.get_answer(habit_id, day)]
+        self.set_answer(habit_id, day, value)
+        return value
 
-    def marks_between(self, habit_id: int, start: date, end: date) -> set[date]:
+    def all_answers(self, habit_id: int) -> dict[date, bool]:
+        """Все ответы привычки; дней без данных в словаре нет."""
         rows = self.conn.execute(
-            "SELECT day FROM marks WHERE habit_id = ? AND day BETWEEN ? AND ?",
-            (habit_id, start.isoformat(), end.isoformat()),
+            "SELECT day, value FROM marks WHERE habit_id = ?", (habit_id,)
         ).fetchall()
-        return {date.fromisoformat(r["day"]) for r in rows}
+        return {date.fromisoformat(r["day"]): bool(r["value"]) for r in rows}
+
+    def is_marked(self, habit_id: int, day: date) -> bool:
+        """Есть ли за день ответ «да»."""
+        return self.get_answer(habit_id, day) is True
 
     def all_marks(self, habit_id: int) -> set[date]:
-        rows = self.conn.execute("SELECT day FROM marks WHERE habit_id = ?", (habit_id,)).fetchall()
-        return {date.fromisoformat(r["day"]) for r in rows}
+        """Дни с ответом «да» — по ним считаются серии и число отметок."""
+        return {day for day, value in self.all_answers(habit_id).items() if value}
 
 
 def streak(habit: Habit, marks: set[date], today: date) -> int:

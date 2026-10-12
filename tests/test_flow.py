@@ -155,8 +155,35 @@ async def test_add_with_buttons_only_and_mark(bot: Harness) -> None:
     calls = await bot.press(find(buttons(today), "Зарядка"))
     assert next(iter(buttons(calls[0]))) == "✅ 💪 Зарядка"
     assert len(bot.storage.all_marks(habit.id)) == 1
-    await bot.press(find(buttons(today), "Зарядка"))
-    assert bot.storage.all_marks(habit.id) == set()
+    # Второе нажатие — «не сделано», третье — снова «нет данных».
+    calls = await bot.press(find(buttons(today), "Зарядка"))
+    assert next(iter(buttons(calls[0]))) == "➖ 💪 Зарядка"
+    assert bot.storage.all_answers(habit.id) == {datetime.now().date(): False}
+    calls = await bot.press(find(buttons(today), "Зарядка"))
+    assert next(iter(buttons(calls[0]))) == "▫️ 💪 Зарядка"
+    assert bot.storage.all_answers(habit.id) == {}
+
+
+async def test_card_shows_three_states_per_day(bot: Harness) -> None:
+    card = await add(bot, "Сладкое", "Вредная", "🍬")
+    [habit] = bot.storage.list_habits(42)
+    today = datetime.now().date()
+    assert "Сегодня: <b>нет данных</b>" in card.text
+    assert rows(card)[0] == ["Сегодня: было", "Сегодня: не было"]
+
+    card = (await bot.press(buttons(card)["Сегодня: не было"]))[0]
+    assert "Сегодня: <b>не было</b>" in card.text
+    assert rows(card)[0] == ["Сегодня: было", "✔️ Сегодня: не было"]
+    assert bot.storage.all_answers(habit.id) == {today: False}
+
+    card = (await bot.press(buttons(card)["Сегодня: было"]))[0]
+    assert "Сегодня: <b>было</b>" in card.text
+    assert bot.storage.all_answers(habit.id) == {today: True}
+
+    # Повторное нажатие на выбранный ответ снимает его.
+    card = (await bot.press(buttons(card)["✔️ Сегодня: было"]))[0]
+    assert "Сегодня: <b>нет данных</b>" in card.text
+    assert bot.storage.all_answers(habit.id) == {}
 
 
 async def test_own_emoji_and_typed_time(bot: Harness) -> None:
@@ -214,8 +241,14 @@ async def test_calendar_edit_any_past_day_and_delete(bot: Harness) -> None:
     assert bot.storage.list_habits(42)[0].created_on == day
     if day.month == today.month:
         assert f"🍬 {day.day}" in buttons(calls[0])
+    # Второе нажатие — «не было», и в подписи оно считается отдельно от «нет данных».
+    calls = await bot.press(target, photo=True)
+    assert bot.storage.all_answers(habit.id) == {day: False}
+    if day.month == today.month:
+        assert f"➖ {day.day}" in buttons(calls[0])
+        assert "Не было: <b>1</b> · нет данных: <b>3</b>" in calls[0].media.caption
     await bot.press(target, photo=True)
-    assert bot.storage.all_marks(habit.id) == set()
+    assert bot.storage.all_answers(habit.id) == {}
 
     # Будущий день и день больше года назад не отмечаются.
     for bad in (today + timedelta(days=1), today - timedelta(days=400)):
@@ -299,8 +332,21 @@ async def test_several_habits_and_reminder_answer(bot: Harness) -> None:
     calls = await bot.press(answers["Было"])
     assert "Записал: было" in calls[0].text
     assert len(bot.storage.all_marks(smoking.id)) == 1
-    await bot.press(find(answers, "Не было"))
-    assert bot.storage.all_marks(smoking.id) == set()
+    # «Не было» — это ответ, а не снятая отметка: он остаётся в базе.
+    calls = await bot.press(find(answers, "Не было"))
+    assert "Записал: не было" in calls[0].text
+    assert bot.storage.all_answers(smoking.id) == {datetime.now().date(): False}
+
+    # У полезной привычки в напоминании тоже два ответа.
+    exercise = bot.storage.list_habits(42)[0]
+    _, markup = reminder_message(exercise)
+    answers = {b.text: b.callback_data for row in markup.inline_keyboard for b in row}
+    assert list(answers) == ["✅ Сделано", "Не сделано"]
+    calls = await bot.press(answers["Не сделано"])
+    assert "Записал: не сделано" in calls[0].text
+    assert bot.storage.get_answer(exercise.id, datetime.now().date()) is False
+    await bot.press(answers["✅ Сделано"])
+    assert bot.storage.get_answer(exercise.id, datetime.now().date()) is True
 
 
 async def test_change_emoji_reminder_and_timezone(bot: Harness) -> None:
@@ -365,8 +411,8 @@ async def test_share_calendar_sends_picture_with_stats_and_invitation(bot: Harne
     await add(bot, "Сладкое", "Вредная", "🍬")
     good, bad = bot.storage.list_habits(42)
     today = datetime.now().date()
-    bot.storage.set_mark(good.id, today, True)
-    bot.storage.set_mark(bad.id, today, True)
+    bot.storage.set_answer(good.id, today, True)
+    bot.storage.set_answer(bad.id, today, True)
     link = "https://t.me/test_bot?start=ref42"
 
     # Календарь одной привычки.
