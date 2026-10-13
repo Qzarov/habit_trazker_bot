@@ -326,6 +326,16 @@ async def test_tick_next_day_asks_about_yesterday(storage: Storage) -> None:
     assert await tick(storage, send, now_utc=now) == 0  # в тот же день повторно не пишем
 
 
+async def test_tick_skips_switched_off_reminder(storage: Storage) -> None:
+    habit = storage.add_habit(1, "Зарядка", GOOD, "08:00", TODAY)
+    now = datetime(2026, 10, 11, 5, 0, tzinfo=ZoneInfo("UTC"))  # 08:00 по Москве
+    storage.set_remind_enabled(1, habit.id, False)
+    assert await _run_tick(storage, now) == []
+    assert storage.get_habit(1, habit.id).remind_at == "08:00"  # время сохранилось
+    storage.set_remind_enabled(1, habit.id, True)
+    assert await _run_tick(storage, now) == ["Зарядка"]
+
+
 async def test_tick_respects_user_timezone(storage: Storage) -> None:
     storage.add_habit(1, "Зарядка", GOOD, "08:00", TODAY)
     storage.set_tz(1, "Asia/Yekaterinburg")  # UTC+5

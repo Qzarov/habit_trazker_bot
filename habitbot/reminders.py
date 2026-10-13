@@ -39,7 +39,7 @@ def zone(name: str) -> ZoneInfo:
 
 def is_due(habit: Habit, now: datetime) -> bool:
     """Пора ли напомнить: время наступило (не позже `GRACE` назад) и сегодня ещё не писали."""
-    if not habit.remind_at or habit.last_reminded == now.date():
+    if not habit.reminds or habit.last_reminded == now.date():
         return False
     hours, minutes = map(int, habit.remind_at.split(":"))
     at = now.replace(hour=hours, minute=minutes, second=0, microsecond=0)

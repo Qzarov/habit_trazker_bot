@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS habits (
     created_on TEXT NOT NULL,
     archived INTEGER NOT NULL DEFAULT 0,
     last_reminded TEXT,
-    remind_next_day INTEGER NOT NULL DEFAULT 0
+    remind_next_day INTEGER NOT NULL DEFAULT 0,
+    remind_enabled INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS marks (
     habit_id INTEGER NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
@@ -76,7 +77,8 @@ CREATE TABLE IF NOT EXISTS habits (
     created_on TEXT NOT NULL,
     archived INTEGER NOT NULL DEFAULT 0,
     last_reminded TEXT,
-    remind_next_day INTEGER NOT NULL DEFAULT 0
+    remind_next_day INTEGER NOT NULL DEFAULT 0,
+    remind_enabled INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS marks (
     habit_id BIGINT NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
@@ -146,6 +148,13 @@ class Habit:
     last_reminded: date | None
     #: Напоминание приходит на следующий день и спрашивает про вчерашний.
     remind_next_day: bool = False
+    #: Выключенное напоминание не приходит, но время (`remind_at`) за ним сохраняется.
+    remind_enabled: bool = True
+
+    @property
+    def reminds(self) -> bool:
+        """Приходит ли напоминание: время задано и напоминание не выключено."""
+        return bool(self.remind_at) and self.remind_enabled
 
     @property
     def is_bad(self) -> bool:
@@ -183,6 +192,7 @@ def _habit(row: Mapping[str, object]) -> Habit:
         created_on=date.fromisoformat(row["created_on"]),
         last_reminded=date.fromisoformat(row["last_reminded"]) if row["last_reminded"] else None,
         remind_next_day=bool(row["remind_next_day"]),
+        remind_enabled=bool(row["remind_enabled"]),
     )
 
 
@@ -204,6 +214,11 @@ class Storage:
                 "ALTER TABLE habits ADD COLUMN IF NOT EXISTS "
                 "remind_next_day INTEGER NOT NULL DEFAULT 0"
             )
+            # И для выключателя напоминания: прежние напоминания включены.
+            self.conn.execute(
+                "ALTER TABLE habits ADD COLUMN IF NOT EXISTS "
+                "remind_enabled INTEGER NOT NULL DEFAULT 1"
+            )
             return
         self.conn = sqlite3.connect(target)
         self.conn.row_factory = sqlite3.Row
@@ -217,6 +232,11 @@ class Storage:
         if "remind_next_day" not in columns:
             self.conn.execute(
                 "ALTER TABLE habits ADD COLUMN remind_next_day INTEGER NOT NULL DEFAULT 0"
+            )
+        # Выключатель напоминания: прежние напоминания включены.
+        if "remind_enabled" not in columns:
+            self.conn.execute(
+                "ALTER TABLE habits ADD COLUMN remind_enabled INTEGER NOT NULL DEFAULT 1"
             )
         # То же для приглашений.
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(users)")}
@@ -384,9 +404,20 @@ class Storage:
         self.conn.commit()
 
     def set_reminder(self, user_id: int, habit_id: int, remind_at: str | None) -> bool:
+        """Задаёт время напоминания и включает его: выбрали время — значит, напоминать."""
         cur = self.conn.execute(
-            "UPDATE habits SET remind_at = ?, last_reminded = NULL WHERE id = ? AND user_id = ?",
+            "UPDATE habits SET remind_at = ?, remind_enabled = 1, last_reminded = NULL "
+            "WHERE id = ? AND user_id = ?",
             (remind_at, habit_id, user_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def set_remind_enabled(self, user_id: int, habit_id: int, on: bool) -> bool:
+        """Включает или выключает напоминание, не трогая его время."""
+        cur = self.conn.execute(
+            "UPDATE habits SET remind_enabled = ? WHERE id = ? AND user_id = ?",
+            (int(on), habit_id, user_id),
         )
         self.conn.commit()
         return cur.rowcount > 0
@@ -402,7 +433,8 @@ class Storage:
 
     def habits_with_reminders(self) -> list[Habit]:
         rows = self.conn.execute(
-            "SELECT * FROM habits WHERE archived = 0 AND remind_at IS NOT NULL"
+            "SELECT * FROM habits WHERE archived = 0 AND remind_at IS NOT NULL "
+            "AND remind_enabled = 1"
         ).fetchall()
         return [_habit(r) for r in rows]
 

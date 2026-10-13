@@ -165,7 +165,7 @@ class Tz(StatesGroup):
 
 
 class HabitCb(CallbackData, prefix="h"):
-    action: str  # open | cal | rem | norem | nextday | del | delok | list | emoji
+    action: str  # open | cal | rem | norem | remon | nextday | del | delok | list | emoji
     id: int = 0
 
 
@@ -360,9 +360,14 @@ def build_router(storage: Storage) -> Router:
         day = today_of(habit.user_id)
         yesterday = day - timedelta(days=1)
         kind = "вредная" if habit.is_bad else "полезная"
-        remind = f"каждый день в {habit.remind_at}" if habit.remind_at else "нет"
-        if habit.remind_at and habit.remind_next_day:
-            remind += ", про вчерашний день"
+        if not habit.remind_at:
+            remind = "нет"
+        elif not habit.remind_enabled:
+            remind = f"выключено (время — {habit.remind_at})"
+        else:
+            remind = f"каждый день в {habit.remind_at}"
+            if habit.remind_next_day:
+                remind += ", про вчерашний день"
         text = (
             f"{habit.icon} <b>{escape(habit.name)}</b>\n"
             f"Тип: {kind}\n"
@@ -373,14 +378,17 @@ def build_router(storage: Storage) -> Router:
         days = [("Сегодня", day, 0)]
         if yesterday >= habit.created_on:
             days.append(("Вчера", yesterday, 1))
-        for title, d, back in days:
-            # Ответ за день — словами в тексте и галочкой на кнопке. Кнопок две: «да» и «нет»;
-            # повторное нажатие на выбранную снимает ответ — снова «нет данных».
-            answer = storage.get_answer(habit.id, d)
-            text += f"\n{title}: <b>{answer_word(habit, answer)}</b>"
-            for value in (True, False):
+        # Ответ за день — словами в тексте и галочкой на кнопке. Кнопок на день две: «да» и
+        # «нет»; повторное нажатие на выбранную снимает ответ — снова «нет данных».
+        answers = {back: storage.get_answer(habit.id, d) for _, d, back in days}
+        for title, _, back in days:
+            text += f"\n{title}: <b>{answer_word(habit, answers[back])}</b>"
+        # Ряды — по ответу: все «да» в одном ряду, все «нет» в другом; колонки — сегодня и вчера.
+        # Когда день один (привычка заведена сегодня), обе его кнопки встают в один ряд.
+        for value in (True, False):
+            for title, _, back in days:
                 kb.button(
-                    text=("✔️ " if answer is value else "")
+                    text=("✔️ " if answers[back] is value else "")
                     + f"{title}: {answer_word(habit, value)}",
                     callback_data=MarkCb(id=habit.id, back=back, src="c", on=int(value)),
                 )
@@ -389,7 +397,7 @@ def build_router(storage: Storage) -> Router:
         kb.button(text="🎨 Эмодзи", callback_data=HabitCb(action="emoji", id=habit.id))
         kb.button(text="🗑 Удалить", callback_data=HabitCb(action="del", id=habit.id))
         kb.button(text="← К списку", callback_data=HabitCb(action="list"))
-        kb.adjust(*([2] * len(days)), 2, 2, 1)
+        kb.adjust(*([2] * len(days)), 2, 2, 1)  # кнопок ответа 2 × дней — рядов столько же
         return text, kb.as_markup()
 
     def calendar_view(
@@ -872,7 +880,7 @@ def build_router(storage: Storage) -> Router:
 
     def added_text(habit: Habit) -> str:
         text, _ = card_view(habit)
-        if habit.remind_at:
+        if habit.reminds:
             tz = storage.get_tz(habit.user_id)
             return f"Добавлено. Часовой пояс напоминаний: {tz}.\n\n{text}"
         return f"Добавлено.\n\n{text}"
@@ -1133,10 +1141,13 @@ def build_router(storage: Storage) -> Router:
     def reminder_view(habit: Habit) -> tuple[str, InlineKeyboardMarkup]:
         extra = [next_day_button(habit.remind_next_day, habit.id)]
         if habit.remind_at:
-            extra.append(("Убрать напоминание", HabitCb(action="norem", id=habit.id)))
-        extra.append(("Отмена", HabitCb(action="open", id=habit.id)))
+            # Выключатель вместо удаления: время остаётся, включить обратно — одно нажатие.
+            state = "включено ✔️" if habit.remind_enabled else "выключено"
+            extra.append((f"Напоминание: {state}", HabitCb(action="remon", id=habit.id)))
+        extra.append(("← К привычке", HabitCb(action="open", id=habit.id)))
         about = ", про вчерашний день" if habit.remind_next_day else ""
-        current = f"Сейчас: {habit.remind_at}{about}. " if habit.remind_at else ""
+        off = "" if habit.remind_enabled else ", выключено"
+        current = f"Сейчас: {habit.remind_at}{about}{off}. " if habit.remind_at else ""
         question = (
             "Во сколько спрашивать про вчерашний день"
             if habit.remind_next_day
@@ -1148,6 +1159,21 @@ def build_router(storage: Storage) -> Router:
             f"Часовой пояс: {storage.get_tz(habit.user_id)}."
         )
         return text, time_keyboard(*extra)
+
+    @router.callback_query(Remind.time, HabitCb.filter(F.action == "remon"))
+    async def toggle_reminder(query: CallbackQuery, callback_data: HabitCb) -> None:
+        """Включает и выключает напоминание; время и «на следующий день» остаются прежними."""
+        habit = await habit_or_alert(query, callback_data.id)
+        if habit is None:
+            return
+        on = not habit.remind_enabled
+        storage.set_remind_enabled(habit.user_id, habit.id, on)
+        habit = storage.get_habit(habit.user_id, habit.id) or habit
+        text, kb = reminder_view(habit)
+        await query.message.edit_text(text, reply_markup=kb)
+        await query.answer(
+            f"Напоминание включено: {habit.remind_at}" if on else "Напоминание выключено"
+        )
 
     @router.callback_query(Remind.time, HabitCb.filter(F.action == "nextday"))
     async def toggle_next_day(query: CallbackQuery, callback_data: HabitCb) -> None:

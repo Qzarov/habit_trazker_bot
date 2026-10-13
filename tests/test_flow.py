@@ -185,6 +185,17 @@ async def test_card_shows_three_states_per_day(bot: Harness) -> None:
     assert "Сегодня: <b>нет данных</b>" in card.text
     assert bot.storage.all_answers(habit.id) == {}
 
+    # Когда есть и вчерашний день: «было» за оба дня в одном ряду, «не было» — в другом.
+    bot.storage.backdate(habit.id, today - timedelta(days=1))
+    card = (await bot.press(buttons(card)["Сегодня: не было"]))[0]
+    assert rows(card)[:2] == [
+        ["Сегодня: было", "Вчера: было"],
+        ["✔️ Сегодня: не было", "Вчера: не было"],
+    ]
+    card = (await bot.press(buttons(card)["Вчера: было"]))[0]
+    assert bot.storage.all_answers(habit.id) == {today: False, today - timedelta(days=1): True}
+    assert rows(card)[2] == ["📅 Календарь", "⏰ Напоминание"]
+
 
 async def test_own_emoji_and_typed_time(bot: Harness) -> None:
     await bot.press("n:add")
@@ -392,6 +403,40 @@ async def test_next_day_reminder_records_answer_for_yesterday(bot: Harness) -> N
     habit = bot.storage.get_habit(42, habit.id)
     assert (habit.remind_at, habit.remind_next_day) == ("09:00", False)
     assert "как сегодня?" in reminder_message(habit, today)[0]
+
+
+async def test_reminder_is_switched_off_and_on_keeping_time(bot: Harness) -> None:
+    card = await add(bot, "Зарядка", "Полезная", "💪", "08:00")
+    [habit] = bot.storage.list_habits(42)
+    screen = (await bot.press(find(buttons(card), "Напоминание")))[0]
+    # Вместо «Убрать напоминание» — выключатель.
+    assert "Напоминание: включено ✔️" in buttons(screen)
+    assert not any("Убрать" in text for text in buttons(screen))
+
+    screen = (await bot.press(find(buttons(screen), "Напоминание:")))[0]
+    assert "Напоминание: выключено" in buttons(screen) and "08:00, выключено" in screen.text
+    habit = bot.storage.get_habit(42, habit.id)
+    assert (habit.remind_at, habit.remind_enabled, habit.reminds) == ("08:00", False, False)
+    assert bot.storage.habits_with_reminders() == []
+    card = (await bot.press(find(buttons(screen), "К привычке")))[0]
+    assert "Напоминание: выключено (время — 08:00)" in card.text
+
+    # Включить обратно — одно нажатие, время то же.
+    screen = (await bot.press(find(buttons(card), "Напоминание")))[0]
+    screen = (await bot.press(find(buttons(screen), "Напоминание:")))[0]
+    assert "Напоминание: включено ✔️" in buttons(screen)
+    assert [h.remind_at for h in bot.storage.habits_with_reminders()] == ["08:00"]
+
+    # Выбор времени у выключенного напоминания включает его.
+    await bot.press(find(buttons(screen), "Напоминание:"))
+    card = (await bot.press(buttons(screen)["21:00"]))[0]
+    assert "каждый день в 21:00" in card.text
+    assert bot.storage.get_habit(42, habit.id).reminds
+
+    # У привычки без времени выключателя нет: включать нечего, сначала выбирают время.
+    plain = await add(bot, "Вода", "Полезная", "💧")
+    screen = (await bot.press(find(buttons(plain), "Напоминание")))[0]
+    assert not any(text.startswith("Напоминание:") for text in buttons(screen))
 
 
 async def test_reminder_buttons_sent_before_update_still_work(bot: Harness) -> None:
