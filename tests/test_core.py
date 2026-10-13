@@ -282,7 +282,8 @@ def test_is_due_window(storage: Storage) -> None:
 async def _run_tick(storage: Storage, now: datetime) -> list[str]:
     sent: list[str] = []
 
-    async def send(habit) -> None:
+    async def send(habit, day) -> None:
+        assert day == now.astimezone(ZoneInfo(storage.get_tz(habit.user_id))).date()
         sent.append(habit.name)
 
     await tick(storage, send, now_utc=now)
@@ -301,6 +302,28 @@ async def test_tick_sends_once_and_skips_done(storage: Storage) -> None:
     assert await _run_tick(storage, now) == ["Зарядка", "Сладкое"]
     assert await _run_tick(storage, now) == []
     assert storage.get_habit(1, good.id).last_reminded == TODAY
+
+
+async def test_tick_next_day_asks_about_yesterday(storage: Storage) -> None:
+    created = TODAY - timedelta(days=2)
+    yesterday = TODAY - timedelta(days=1)
+    kw = {"remind_at": "08:00", "today": created, "remind_next_day": True}
+    storage.add_habit(1, "Сладкое", BAD, **kw)
+    said_no = storage.add_habit(1, "Кофе", BAD, **kw)
+    done = storage.add_habit(1, "Зарядка", GOOD, **kw)
+    storage.add_habit(1, "Чтение", GOOD, "08:00", TODAY, remind_next_day=True)  # заведена сегодня
+    # За вчера уже есть ответ — любой, «да» или «нет»: день закончился, второй раз не спрашиваем.
+    storage.set_answer(said_no.id, yesterday, False)
+    storage.set_answer(done.id, yesterday, True)
+    asked: list[tuple[str, date]] = []
+
+    async def send(habit, day) -> None:
+        asked.append((habit.name, day))
+
+    now = datetime(2026, 10, 11, 5, 0, tzinfo=ZoneInfo("UTC"))  # 08:00 по Москве
+    assert await tick(storage, send, now_utc=now) == 1
+    assert asked == [("Сладкое", yesterday)]
+    assert await tick(storage, send, now_utc=now) == 0  # в тот же день повторно не пишем
 
 
 async def test_tick_respects_user_timezone(storage: Storage) -> None:

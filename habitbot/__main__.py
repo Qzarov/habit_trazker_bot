@@ -46,7 +46,9 @@ async def main() -> None:
     dispatcher.include_router(build_router(storage))
     await bot.set_my_commands(COMMANDS)
 
-    loop = asyncio.create_task(reminders.run(storage, lambda habit: send_reminder(bot, habit)))
+    loop = asyncio.create_task(
+        reminders.run(storage, lambda habit, day: send_reminder(bot, habit, day))
+    )
     try:
         await dispatcher.start_polling(bot)
     finally:

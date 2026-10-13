@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS habits (
     remind_at TEXT,
     created_on TEXT NOT NULL,
     archived INTEGER NOT NULL DEFAULT 0,
-    last_reminded TEXT
+    last_reminded TEXT,
+    remind_next_day INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS marks (
     habit_id INTEGER NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
@@ -74,7 +75,8 @@ CREATE TABLE IF NOT EXISTS habits (
     remind_at TEXT,
     created_on TEXT NOT NULL,
     archived INTEGER NOT NULL DEFAULT 0,
-    last_reminded TEXT
+    last_reminded TEXT,
+    remind_next_day INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS marks (
     habit_id BIGINT NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
@@ -142,6 +144,8 @@ class Habit:
     remind_at: str | None
     created_on: date
     last_reminded: date | None
+    #: Напоминание приходит на следующий день и спрашивает про вчерашний.
+    remind_next_day: bool = False
 
     @property
     def is_bad(self) -> bool:
@@ -178,6 +182,7 @@ def _habit(row: Mapping[str, object]) -> Habit:
         remind_at=row["remind_at"],
         created_on=date.fromisoformat(row["created_on"]),
         last_reminded=date.fromisoformat(row["last_reminded"]) if row["last_reminded"] else None,
+        remind_next_day=bool(row["remind_next_day"]),
     )
 
 
@@ -194,6 +199,11 @@ class Storage:
             self.conn.execute(
                 "ALTER TABLE marks ADD COLUMN IF NOT EXISTS value INTEGER NOT NULL DEFAULT 1"
             )
+            # То же для напоминаний на следующий день: прежние — в тот же день.
+            self.conn.execute(
+                "ALTER TABLE habits ADD COLUMN IF NOT EXISTS "
+                "remind_next_day INTEGER NOT NULL DEFAULT 0"
+            )
             return
         self.conn = sqlite3.connect(target)
         self.conn.row_factory = sqlite3.Row
@@ -203,6 +213,11 @@ class Storage:
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(habits)")}
         if "emoji" not in columns:
             self.conn.execute("ALTER TABLE habits ADD COLUMN emoji TEXT")
+        # Напоминание на следующий день: прежние напоминания — в тот же день.
+        if "remind_next_day" not in columns:
+            self.conn.execute(
+                "ALTER TABLE habits ADD COLUMN remind_next_day INTEGER NOT NULL DEFAULT 0"
+            )
         # То же для приглашений.
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(users)")}
         if "referred_by" not in columns:
@@ -318,12 +333,13 @@ class Storage:
         remind_at: str | None,
         today: date,
         emoji: str | None = None,
+        remind_next_day: bool = False,
     ) -> Habit:
         self.ensure_user(user_id)
         cur = self.conn.execute(
-            "INSERT INTO habits (user_id, name, kind, emoji, remind_at, created_on) "
-            "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
-            (user_id, name, kind, emoji, remind_at, today.isoformat()),
+            "INSERT INTO habits (user_id, name, kind, emoji, remind_at, created_on, "
+            "remind_next_day) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            (user_id, name, kind, emoji, remind_at, today.isoformat(), int(remind_next_day)),
         )
         habit_id = int(cur.fetchone()["id"])  # до фиксации: так требует SQLite
         self.conn.commit()
@@ -371,6 +387,15 @@ class Storage:
         cur = self.conn.execute(
             "UPDATE habits SET remind_at = ?, last_reminded = NULL WHERE id = ? AND user_id = ?",
             (remind_at, habit_id, user_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def set_remind_next_day(self, user_id: int, habit_id: int, on: bool) -> bool:
+        """Про какой день спрашивает напоминание: про вчерашний (`True`) или про текущий."""
+        cur = self.conn.execute(
+            "UPDATE habits SET remind_next_day = ? WHERE id = ? AND user_id = ?",
+            (int(on), habit_id, user_id),
         )
         self.conn.commit()
         return cur.rowcount > 0

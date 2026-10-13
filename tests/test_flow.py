@@ -326,7 +326,8 @@ async def test_several_habits_and_reminder_answer(bot: Harness) -> None:
     ]
 
     smoking = bot.storage.list_habits(42)[2]
-    text, markup = reminder_message(smoking)
+    today = datetime.now().date()
+    text, markup = reminder_message(smoking, today)
     assert "🚬" in text
     answers = {b.text: b.callback_data for row in markup.inline_keyboard for b in row}
     calls = await bot.press(answers["Было"])
@@ -339,7 +340,7 @@ async def test_several_habits_and_reminder_answer(bot: Harness) -> None:
 
     # У полезной привычки в напоминании тоже два ответа.
     exercise = bot.storage.list_habits(42)[0]
-    _, markup = reminder_message(exercise)
+    _, markup = reminder_message(exercise, today)
     answers = {b.text: b.callback_data for row in markup.inline_keyboard for b in row}
     assert list(answers) == ["✅ Сделано", "Не сделано"]
     calls = await bot.press(answers["Не сделано"])
@@ -347,6 +348,58 @@ async def test_several_habits_and_reminder_answer(bot: Harness) -> None:
     assert bot.storage.get_answer(exercise.id, datetime.now().date()) is False
     await bot.press(answers["✅ Сделано"])
     assert bot.storage.get_answer(exercise.id, datetime.now().date()) is True
+
+
+async def test_next_day_reminder_records_answer_for_yesterday(bot: Harness) -> None:
+    # При добавлении: переключатель на экране выбора времени.
+    await bot.press("n:add")
+    kinds = buttons(await bot.say("Сладкое"))
+    palette = buttons((await bot.press(find(kinds, "Вредная")))[0])
+    times = (await bot.press(palette["🍬"]))[0]
+    assert "На следующий день: нет" in buttons(times)
+    times = (await bot.press(find(buttons(times), "На следующий день")))[0]
+    assert "На следующий день: да ✔️" in buttons(times) and "про вчерашний день" in times.text
+    card = (await bot.press(buttons(times)["09:00"]))[0]
+    assert "Напоминание: каждый день в 09:00, про вчерашний день" in card.text
+    [habit] = bot.storage.list_habits(42)
+    assert habit.remind_next_day
+
+    today = datetime.now().date()
+    yesterday = today - timedelta(days=1)
+    bot.storage.backdate(habit.id, yesterday)
+    habit = bot.storage.get_habit(42, habit.id)
+    text, markup = reminder_message(habit, yesterday)
+    assert f"как прошёл вчерашний день ({yesterday:%d.%m})?" in text
+    answers = {b.text: b.callback_data for row in markup.inline_keyboard for b in row}
+    calls = await bot.press(find(answers, "Не было"))
+    assert f"<b>Сладкое</b> · {yesterday:%d.%m}" in calls[0].text
+    # Ответ записан за вчера, сегодняшний день остаётся без данных.
+    assert bot.storage.all_answers(habit.id) == {yesterday: False}
+    await bot.press(answers["Было"])
+    assert bot.storage.all_answers(habit.id) == {yesterday: True}
+
+    # Кнопка с днём, которого у привычки нет (будущий или до начала учёта), ничего не пишет.
+    for wrong in (today + timedelta(days=1), yesterday - timedelta(days=1)):
+        calls = await bot.press(f"r:{habit.id}:{wrong:%Y%m%d}:1")
+        assert calls[0].show_alert
+    assert bot.storage.all_answers(habit.id) == {yesterday: True}
+
+    # На карточке: переключатель действует сразу и время не трогает.
+    screen = (await bot.press(find(buttons(card), "Напоминание")))[0]
+    assert "Сейчас: 09:00, про вчерашний день." in screen.text
+    screen = (await bot.press(find(buttons(screen), "На следующий день")))[0]
+    assert "На следующий день: нет" in buttons(screen)
+    habit = bot.storage.get_habit(42, habit.id)
+    assert (habit.remind_at, habit.remind_next_day) == ("09:00", False)
+    assert "как сегодня?" in reminder_message(habit, today)[0]
+
+
+async def test_reminder_buttons_sent_before_update_still_work(bot: Harness) -> None:
+    await add(bot, "Зарядка", "Полезная", "💪")
+    [habit] = bot.storage.list_habits(42)
+    calls = await bot.press(f"m:{habit.id}:0:r:1")  # кнопка прежнего вида, без дня
+    assert "Отмечено" in calls[0].text
+    assert bot.storage.all_answers(habit.id) == {datetime.now().date(): True}
 
 
 async def test_change_emoji_reminder_and_timezone(bot: Harness) -> None:

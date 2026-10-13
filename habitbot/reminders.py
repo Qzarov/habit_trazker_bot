@@ -6,7 +6,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .db import Habit, Storage
@@ -48,11 +48,11 @@ def is_due(habit: Habit, now: datetime) -> bool:
 
 async def run(
     storage: Storage,
-    send: Callable[[Habit], Awaitable[None]],
+    send: Callable[[Habit, date], Awaitable[None]],
     *,
     interval: float = 30.0,
 ) -> None:
-    """Бесконечный цикл напоминаний. `send` — отправка сообщения по привычке."""
+    """Бесконечный цикл напоминаний. `send` — отправка сообщения по привычке про данный день."""
     while True:
         try:
             await tick(storage, send)
@@ -63,7 +63,7 @@ async def run(
 
 async def tick(
     storage: Storage,
-    send: Callable[[Habit], Awaitable[None]],
+    send: Callable[[Habit, date], Awaitable[None]],
     now_utc: datetime | None = None,
 ) -> int:
     """Один проход; возвращает число отправленных напоминаний."""
@@ -75,11 +75,19 @@ async def tick(
             continue
         # Отмечаем до отправки: упавшая отправка не должна слать одно и то же каждые полминуты.
         storage.mark_reminded(habit.id, now.date())
-        # Полезную привычку, которую сегодня уже отметили, не дёргаем.
-        if not habit.is_bad and storage.is_marked(habit.id, now.date()):
-            continue
+        if habit.remind_next_day:
+            # Спрашиваем про вчерашний день. Он уже закончился, поэтому любой ответ за него
+            # окончательный — второй раз не спрашиваем; до заведения привычки спрашивать не о чем.
+            day = now.date() - timedelta(days=1)
+            if day < habit.created_on or storage.get_answer(habit.id, day) is not None:
+                continue
+        else:
+            day = now.date()
+            # Полезную привычку, которую сегодня уже отметили, не дёргаем.
+            if not habit.is_bad and storage.is_marked(habit.id, day):
+                continue
         try:
-            await send(habit)
+            await send(habit, day)
             sent += 1
         except Exception:
             log.exception("reminder for habit %s not sent", habit.id)
