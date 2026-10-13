@@ -82,15 +82,24 @@ HELP = (
     "день — удобно, если итог дня ясен только к ночи.\n"
     "• У каждой привычки свой эмодзи — им помечены отмеченные дни на картинке.\n\n"
     f"{BTN_TODAY} — отметить за сегодня\n"
-    f"{BTN_HABITS} — список, календарь, напоминания, эмодзи, удаление\n"
+    f"{BTN_HABITS} — список, календарь, напоминания, эмодзи\n"
     f"{BTN_CAL} — общая картинка месяца со всеми привычками\n"
     f"{BTN_ADD} — новая привычка\n"
     f"{BTN_TZ} — по нему приходят напоминания и считается «сегодня»\n"
     f"{BTN_INVITE} — ваша ссылка-приглашение для друзей"
 )
 
-GOOD_EMOJI = ["💪", "🏃", "📚", "💧", "🧘", "🥗", "😴", "🦷", "🎯", "✍️", "🎸", "🧹"]
-BAD_EMOJI = ["🚬", "🍺", "🍬", "🍔", "📱", "☕", "🎮", "💸", "🤬", "🍕", "🍷", "🛋️"]
+# Палитры эмодзи: три ряда по шесть. Новые дописывают в конец — кнопки хранят номер в списке.
+GOOD_EMOJI = [
+    "💪", "🏃", "📚", "💧", "🧘", "🥗",
+    "😴", "🦷", "🎯", "✍️", "🎸", "🧹",
+    "🚶", "🚴", "🏊", "🍎", "💊", "🧠",
+]  # fmt: skip
+BAD_EMOJI = [
+    "🚬", "🍺", "🍬", "🍔", "📱", "☕",
+    "🎮", "💸", "🤬", "🍕", "🍷", "🛋️",
+    "🍟", "🥤", "🍫", "📺", "🎰", "🍩",
+]  # fmt: skip
 QUICK_TIMES = ["07:00", "08:00", "09:00", "12:00", "18:00", "20:00", "21:00", "22:00"]
 # Смещения от UTC для кнопок выбора пояса.
 QUICK_ZONES = [
@@ -117,11 +126,21 @@ MENU_TEXT = "<b>Трекер привычек</b>\nЧто делаем?"
 
 #: Пояснение к переключателю «на следующий день» на экранах выбора времени.
 NEXT_DAY_HINT = (
-    "«На следующий день» — в это время я спрошу про вчерашний день, и ответ запишется за него."
+    "«Когда: завтра» — спрошу на следующий день: в это время придёт вопрос про вчерашний день, "
+    "и ответ запишется за него."
 )
 
 #: Значок ответа «нет» на кнопках.
 NO_ICON = "➖"
+
+
+def answer_icon(habit: Habit, answer: bool | None) -> str:
+    """Значок ответа за день на кнопках."""
+    if answer is None:
+        return "▫️"
+    if answer:
+        return "❗️" if habit.is_bad else "✅"
+    return "💪" if habit.is_bad else NO_ICON
 
 
 def answer_word(habit: Habit, answer: bool | None) -> str:
@@ -253,12 +272,7 @@ def build_router(storage: Storage) -> Router:
 
     def mark_label(habit: Habit, answer: bool | None) -> str:
         # Коротко: кнопки стоят в две колонки, пояснение значков — в тексте над ними.
-        title = f"{habit.icon} {habit.name}"
-        if answer is None:
-            return f"▫️ {title}"
-        if answer:
-            return f"❗️ {title}" if habit.is_bad else f"✅ {title}"
-        return f"💪 {title}" if habit.is_bad else f"{NO_ICON} {title}"
+        return f"{answer_icon(habit, answer)} {habit.icon} {habit.name}"
 
     def empty_view() -> tuple[str, InlineKeyboardMarkup]:
         kb = InlineKeyboardBuilder()
@@ -291,13 +305,15 @@ def build_router(storage: Storage) -> Router:
     def cancel_button(kb: InlineKeyboardBuilder) -> None:
         kb.button(text="Отмена", callback_data=NavCb(action="cancel"))
 
-    def time_keyboard(*extra: tuple[str, CallbackData]) -> InlineKeyboardMarkup:
+    def time_keyboard(*rows: list[tuple[str, CallbackData]]) -> InlineKeyboardMarkup:
+        """Быстрый выбор времени и под ним ряды `rows` — в каждом кнопки «подпись, действие»."""
         kb = InlineKeyboardBuilder()
         for value in QUICK_TIMES:
             kb.button(text=value, callback_data=TimeCb(value=value.replace(":", "")))
-        for text, data in extra:
-            kb.button(text=text, callback_data=data)
-        kb.adjust(4, 4, *([1] * len(extra)))
+        for row in rows:
+            for text, data in row:
+                kb.button(text=text, callback_data=data)
+        kb.adjust(4, 4, *(len(row) for row in rows))
         return kb.as_markup()
 
     def emoji_keyboard(kind: str, back: CallbackData) -> InlineKeyboardMarkup:
@@ -306,7 +322,7 @@ def build_router(storage: Storage) -> Router:
         for idx, emoji in enumerate(palette):
             kb.button(text=emoji, callback_data=EmojiCb(kind=kind, idx=idx))
         kb.button(text="Отмена", callback_data=back)
-        kb.adjust(6, 6, 1)
+        kb.adjust(6, 6, 6, 1)
         return kb.as_markup()
 
     def palette_emoji(data: EmojiCb) -> str:
@@ -378,26 +394,20 @@ def build_router(storage: Storage) -> Router:
         days = [("Сегодня", day, 0)]
         if yesterday >= habit.created_on:
             days.append(("Вчера", yesterday, 1))
-        # Ответ за день — словами в тексте и галочкой на кнопке. Кнопок на день две: «да» и
-        # «нет»; повторное нажатие на выбранную снимает ответ — снова «нет данных».
-        answers = {back: storage.get_answer(habit.id, d) for _, d, back in days}
-        for title, _, back in days:
-            text += f"\n{title}: <b>{answer_word(habit, answers[back])}</b>"
-        # Ряды — по ответу: все «да» в одном ряду, все «нет» в другом; колонки — сегодня и вчера.
-        # Когда день один (привычка заведена сегодня), обе его кнопки встают в один ряд.
-        for value in (True, False):
-            for title, _, back in days:
-                kb.button(
-                    text=("✔️ " if answers[back] is value else "")
-                    + f"{title}: {answer_word(habit, value)}",
-                    callback_data=MarkCb(id=habit.id, back=back, src="c", on=int(value)),
-                )
+        # Ответ за день — словами в тексте и на кнопке. Кнопка на день одна: нажатие меняет
+        # ответ по кругу — нет данных → «да» → «нет» → нет данных.
+        for title, d, back in days:
+            answer = storage.get_answer(habit.id, d)
+            text += f"\n{title}: <b>{answer_word(habit, answer)}</b>"
+            kb.button(
+                text=f"{answer_icon(habit, answer)} {title}: {answer_word(habit, answer)}",
+                callback_data=MarkCb(id=habit.id, back=back, src="c"),
+            )
         kb.button(text="📅 Календарь", callback_data=HabitCb(action="cal", id=habit.id))
         kb.button(text="⏰ Напоминание", callback_data=HabitCb(action="rem", id=habit.id))
         kb.button(text="🎨 Эмодзи", callback_data=HabitCb(action="emoji", id=habit.id))
-        kb.button(text="🗑 Удалить", callback_data=HabitCb(action="del", id=habit.id))
         kb.button(text="← К списку", callback_data=HabitCb(action="list"))
-        kb.adjust(*([2] * len(days)), 2, 2, 1)  # кнопок ответа 2 × дней — рядов столько же
+        kb.adjust(*([1] * len(days)), 2, 2)
         return text, kb.as_markup()
 
     def calendar_view(
@@ -765,7 +775,7 @@ def build_router(storage: Storage) -> Router:
         await state.clear()
         if len(storage.list_habits(user_id)) >= MAX_HABITS:
             return (
-                f"Уже {MAX_HABITS} привычек — удалите лишние в разделе «{BTN_HABITS}».",
+                f"Уже {MAX_HABITS} привычек — больше добавить нельзя.",
                 only_menu(),
             )
         await state.set_state(Add.name)
@@ -814,7 +824,7 @@ def build_router(storage: Storage) -> Router:
 
     def next_day_button(on: bool, habit_id: int = 0) -> tuple[str, CallbackData]:
         return (
-            f"На следующий день: {'да ✔️' if on else 'нет'}",
+            f"Когда: {'завтра' if on else 'сегодня'}",
             HabitCb(action="nextday", id=habit_id),
         )
 
@@ -826,9 +836,9 @@ def build_router(storage: Storage) -> Router:
         else:
             hint = "Во сколько напоминать?"
         kb = time_keyboard(
-            next_day_button(next_day),
-            ("Без напоминания", HabitCb(action="norem")),
-            ("Отмена", NavCb(action="cancel")),
+            [next_day_button(next_day)],
+            [("Без напоминания", HabitCb(action="norem"))],
+            [("Отмена", NavCb(action="cancel"))],
         )
         return (
             f"{hint} Выберите время или пришлите своё, например 21:30.\n{NEXT_DAY_HINT}",
@@ -1139,12 +1149,13 @@ def build_router(storage: Storage) -> Router:
         await query.answer()
 
     def reminder_view(habit: Habit) -> tuple[str, InlineKeyboardMarkup]:
-        extra = [next_day_button(habit.remind_next_day, habit.id)]
+        # О каком дне спрашивать и выключатель — в одном ряду.
+        switches = [next_day_button(habit.remind_next_day, habit.id)]
         if habit.remind_at:
             # Выключатель вместо удаления: время остаётся, включить обратно — одно нажатие.
-            state = "включено ✔️" if habit.remind_enabled else "выключено"
-            extra.append((f"Напоминание: {state}", HabitCb(action="remon", id=habit.id)))
-        extra.append(("← К привычке", HabitCb(action="open", id=habit.id)))
+            state = "✅ вкл" if habit.remind_enabled else "🛑 выкл"
+            switches.append((state, HabitCb(action="remon", id=habit.id)))
+        back = [("← К привычке", HabitCb(action="open", id=habit.id))]
         about = ", про вчерашний день" if habit.remind_next_day else ""
         off = "" if habit.remind_enabled else ", выключено"
         current = f"Сейчас: {habit.remind_at}{about}{off}. " if habit.remind_at else ""
@@ -1158,7 +1169,7 @@ def build_router(storage: Storage) -> Router:
             f"пришлите своё, например 21:30.\n{NEXT_DAY_HINT}\n"
             f"Часовой пояс: {storage.get_tz(habit.user_id)}."
         )
-        return text, time_keyboard(*extra)
+        return text, time_keyboard(switches, back)
 
     @router.callback_query(Remind.time, HabitCb.filter(F.action == "remon"))
     async def toggle_reminder(query: CallbackQuery, callback_data: HabitCb) -> None:
