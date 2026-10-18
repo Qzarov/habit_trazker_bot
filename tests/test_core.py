@@ -1,3 +1,4 @@
+import random
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -14,7 +15,20 @@ from habitbot.calendar_image import (
     render_overview,
     shift_month,
 )
-from habitbot.db import BAD, GOOD, Storage, best_clean_streak, streak
+from habitbot.db import BAD, GOOD, Habit, Motivation, Storage, best_clean_streak, streak
+from habitbot.motivation import (
+    AFTER_MISS,
+    AUTO,
+    MAX_CHARS,
+    PRESETS,
+    STYLES,
+    Motivator,
+    build_messages,
+    choose_style,
+    clean,
+    preset,
+    stage,
+)
 from habitbot.reminders import is_due, parse_time, tick
 
 TODAY = date(2026, 10, 11)
@@ -361,12 +375,20 @@ def test_migrate_sqlite_to_postgres(tmp_path) -> None:
     source.set_answer(first.id, TODAY, True)
     source.set_answer(second.id, date(2026, 10, 9), False)
     source.save_share("key", 1, "file", "подпись")
+    source.set_motivation_style(1, "streak")
+    logged = source.log_motivation(1, first.id, TODAY, "streak", 1, False, "серия", "preset")
     source.conn.close()
 
     make_storage()  # очищает тестовую базу
-    assert migrate(path, TEST_DATABASE_URL) == {"users": 2, "habits": 3, "marks": 2, "shares": 1}
+    assert migrate(path, TEST_DATABASE_URL) == {
+        "users": 2, "habits": 3, "marks": 2, "shares": 1, "motivation_messages": 1,
+    }  # fmt: skip
 
     target = Storage(TEST_DATABASE_URL)
+    assert target.get_motivation(1).style == "streak"
+    assert target.get_motivation_message(1, logged).text == "серия"
+    # Новая запись журнала после переноса получает свободный номер.
+    assert target.log_motivation(1, first.id, TODAY, "streak", 0, False, "ещё") == logged + 1
     assert [(h.id, h.name, h.icon, h.remind_at) for h in target.list_habits(1)] == [
         (first.id, "Зарядка", "💪", "08:00")
     ]
@@ -381,3 +403,121 @@ def test_migrate_sqlite_to_postgres(tmp_path) -> None:
     # В непустую базу повторный перенос не пишет.
     with pytest.raises(SystemExit, match="уже есть данные"):
         migrate(path, TEST_DATABASE_URL)
+
+
+# --- мотивация ---
+
+
+def test_tone_and_feedback_storage(storage: Storage) -> None:
+    storage.ensure_user(1)
+    assert storage.get_motivation(1) == Motivation(style=None, why=None, tone=0)
+    for _ in range(5):
+        storage.shift_tone(1, 1)
+    assert storage.get_motivation(1).tone == 2  # не выше предела
+    for _ in range(9):
+        storage.shift_tone(1, -1)
+    assert storage.get_motivation(1).tone == -2
+
+    habit = storage.add_habit(1, "Зарядка", GOOD, "08:00", TODAY)
+    first = storage.log_motivation(1, habit.id, TODAY, "streak", 0, False, "раз")
+    storage.log_motivation(1, habit.id, TODAY, "support", 0, True, "два", "preset")
+    assert storage.set_motivation_feedback(1, first, "ok")
+    assert not storage.set_motivation_feedback(1, first, "harder")  # один раз
+    # «Нет данных» не засчитывается, любой ответ — засчитывается всем сообщениям дня.
+    storage.set_answer(habit.id, TODAY, None)
+    assert storage.motivation_stats(1) == {"streak": (1, 0, 1), "support": (1, 0, 0)}
+    storage.set_answer(habit.id, TODAY, False)
+    assert storage.motivation_stats(1) == {"streak": (1, 1, 1), "support": (1, 1, 0)}
+    assert storage.recent_motivation(habit.id) == ["два", "раз"]
+
+
+def test_choose_style_prefers_chosen_and_experiments() -> None:
+    rng = random.Random(1)
+    chosen = Motivation(style="streak", why=None, tone=0)
+    picks = [choose_style(chosen, {}, ("ease",), rng) for _ in range(2000)]
+    share = sum(1 for style, _ in picks if style == "streak") / len(picks)
+    assert 0.65 < share < 0.75
+    # Эксперименты — другие стили, и они помечены.
+    assert all(exp == (style != "streak") for style, exp in picks)
+    assert {style for style, _ in picks} == set(STYLES)
+
+    # «Подбирай сам»: стиль, после которого отмечают, выбирается чаще; это не эксперимент.
+    auto = Motivation(style=AUTO, why=None, tone=0)
+    stats = {"progress": (20, 19, 0), "curiosity": (20, 1, 0)}
+    picks = [choose_style(auto, stats, (), rng) for _ in range(3000)]
+    assert not any(exp for _, exp in picks)
+    count = {s: sum(1 for p, _ in picks if p == s) for s in ("progress", "curiosity")}
+    assert count["progress"] > 3 * count["curiosity"]
+
+
+def test_stage_by_age() -> None:
+    habit = lambda days: Habit(1, 1, "x", GOOD, None, None, TODAY - timedelta(days=days), None)
+    assert "ease" in stage(habit(3), TODAY)[1]
+    assert "progress" in stage(habit(20), TODAY)[1]
+    assert "identity" in stage(habit(60), TODAY)[1]
+
+
+def test_build_messages_carries_context() -> None:
+    habit = Habit(1, 1, "Сладкое", BAD, None, None, TODAY - timedelta(days=10), None)
+    answers = {TODAY - timedelta(days=1): True, TODAY - timedelta(days=3): False}
+    motivation = Motivation(style="meaning", why="ради зубов", tone=2)
+    system, user = build_messages(habit, TODAY, TODAY, motivation, "meaning", answers, ["старое"])
+    assert "стыда" in system["content"]
+    text = user["content"]
+    for part in ("«Сладкое»", "вредная", "ради зубов", "смысл и ценности", "жёстко", "старое"):
+        assert part in text
+    assert "срыв" in text and "держался" in text
+    # Вчера был срыв — просим поддержку.
+    assert "Вчера был пропуск или срыв" in text
+
+
+def test_clean_model_answer() -> None:
+    assert clean("  «Давай, ты сможешь!»  ") == "Давай, ты сможешь!"
+    assert clean("   ") is None
+    long = clean("слово " * 200)
+    assert len(long) <= MAX_CHARS + 1 and long.endswith("…")
+
+
+def test_preset_fallback() -> None:
+    habit = Habit(1, 1, "Качалка", GOOD, None, None, TODAY - timedelta(days=5), None)
+    answers = {TODAY - timedelta(days=2): True, TODAY - timedelta(days=1): True}
+    text = preset(habit, TODAY, TODAY, "streak", answers, [])
+    assert "{" not in text and text in [
+        t.format(name="Качалка", streak=2, best=0, week=2, week_next=3)
+        for t in PRESETS["streak"]["good"]
+    ]
+    # Недавнюю фразу не повторяем, если есть другая.
+    assert preset(habit, TODAY, TODAY, "streak", answers, [text]) != text
+    # После пропуска — поддержка, а не стиль.
+    missed = {TODAY - timedelta(days=1): False}
+    assert "Качалка" in preset(habit, TODAY, TODAY, "streak", missed, [])
+    assert preset(habit, TODAY, TODAY, "streak", missed, []) in [
+        t.format(name="Качалка") for t in AFTER_MISS["good"]
+    ]
+
+
+async def test_compose_uses_model_and_falls_back_to_presets(storage: Storage) -> None:
+    habit = storage.add_habit(1, "Чтение", GOOD, "21:00", TODAY)
+    storage.set_motivation_style(1, "curiosity")
+    motivator = Motivator(storage, api_key="key", rng=random.Random(3))
+    sent: list[list[dict[str, str]]] = []
+
+    async def model(messages):
+        sent.append(messages)
+        return "  «Какую главу откроешь сегодня?»  "
+
+    motivator.complete = model
+    message_id, text = await motivator.compose(habit, TODAY, TODAY)
+    assert text == "Какую главу откроешь сегодня?" and len(sent) == 1
+    assert storage.get_motivation_message(1, message_id).source == "llm"
+
+    # Модель недоступна или ответила пустым — готовая фраза.
+    for answer in (None, "  "):
+
+        async def broken(messages, answer=answer):
+            return answer
+
+        motivator.complete = broken
+        message_id, text = await motivator.compose(habit, TODAY, TODAY)
+        assert "Чтение" in text
+        assert storage.get_motivation_message(1, message_id).source == "preset"

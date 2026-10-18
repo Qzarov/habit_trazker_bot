@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -22,8 +23,12 @@ from habitbot.bot import (
     build_router,
     reminder_message,
 )
+from habitbot.motivation import Motivator
 
-MENU = [BTN_TODAY, BTN_HABITS, "🗓 Календарь", BTN_ADD, BTN_TZ, "🤝 Пригласить", "❓ Помощь"]
+MENU = [
+    BTN_TODAY, BTN_HABITS, "🗓 Календарь", BTN_ADD,
+    BTN_TZ, "🤝 Пригласить", "🔥 Мотивация", "❓ Помощь",
+]  # fmt: skip
 USER = User(id=42, is_bot=False, first_name="Тест")
 CHAT = Chat(id=42, type="private")
 
@@ -72,8 +77,11 @@ class Harness:
         await self.dp.feed_update(self.bot, Update(update_id=self.n, message=message))
         return self.session.calls[-1]
 
-    async def press(self, data: str, photo: bool = False) -> list[TelegramMethod[Any]]:
-        """Нажатие инлайн-кнопки; `photo` — кнопка под сообщением с картинкой."""
+    async def press(
+        self, data: str, photo: bool = False, markup: Any = None
+    ) -> list[TelegramMethod[Any]]:
+        """Нажатие инлайн-кнопки; `photo` — кнопка под сообщением с картинкой, `markup` —
+        клавиатура сообщения, под которым кнопка."""
         self.n += 1
         before = len(self.session.calls)
         source = Message(
@@ -84,6 +92,7 @@ class Harness:
             photo=[PhotoSize(file_id="shown", file_unique_id="u", width=1, height=1)]
             if photo
             else None,
+            reply_markup=markup,
         )
         query = CallbackQuery(
             id=str(self.n), from_user=USER, chat_instance="x", data=data, message=source
@@ -136,7 +145,7 @@ async def test_start_shows_inline_menu_and_drops_old_keyboard(bot: Harness) -> N
 
 
 async def test_every_screen_leads_back_to_menu(bot: Harness) -> None:
-    for action in ("today", "habits", "help"):
+    for action in ("today", "habits", "help", "mot"):
         screen = (await bot.press(f"n:{action}"))[0]
         back = (await bot.press(find(buttons(screen), "Меню")))[0]
         assert list(buttons(back)) == MENU
@@ -624,3 +633,79 @@ async def test_profile_update_does_not_spoil_first_visit_by_invitation(bot: Harn
     friend = User(id=78, is_bot=False, first_name="Борис")
     await bot.say("/start ref42", user=friend)
     assert bot.storage.invited_count(42) == 1
+
+
+async def test_motivation_settings(bot: Harness) -> None:
+    screen = (await bot.press("n:mot"))[0]
+    assert "Стиль: <b>выключена</b>" in screen.text
+    assert "🔕 Выключить" not in buttons(screen)
+
+    screen = (await bot.press(buttons(screen)["🔥 Серии"]))[0]
+    assert "Стиль: <b>серии</b>" in screen.text and "✔️ 🔥 Серии" in buttons(screen)
+    assert bot.storage.get_motivation(42).style == "streak"
+
+    # «Зачем мне это» — своими словами; потом его можно убрать.
+    await bot.press(buttons(screen)["✍️ Зачем мне это"])
+    assert "Слишком длинно" in (await bot.say("я" * 201)).text
+    screen = await bot.say("  Чтобы   играть с детьми ")
+    assert "«Чтобы играть с детьми»" in screen.text
+    assert bot.storage.get_motivation(42).why == "Чтобы играть с детьми"
+    asking = (await bot.press(buttons(screen)["✍️ Зачем мне это"]))[0]
+    screen = (await bot.press(buttons(asking)["Убрать"]))[0]
+    assert "Зачем тебе это: не указано" in screen.text
+
+    screen = (await bot.press(buttons(screen)["🎲 Подбирай сам"]))[0]
+    assert "Стиль: <b>подбираю сам</b>" in screen.text
+    screen = (await bot.press(buttons(screen)["🔕 Выключить"]))[0]
+    assert bot.storage.get_motivation(42).style is None
+
+
+async def test_reminder_with_motivation_and_feedback(bot: Harness) -> None:
+    await add(bot, "Зарядка", "Полезная", "💪", "08:00")
+    [habit] = bot.storage.list_habits(42)
+    bot.storage.set_motivation_style(42, "support")
+    today = datetime.now().date()
+    # Без ключа — готовые фразы; они так же попадают в журнал и получают кнопки отзыва.
+    always_preferred = random.Random()
+    always_preferred.random = lambda: 0.0  # без экспериментов: стиль — выбранный
+    motivator = Motivator(bot.storage, api_key="", rng=always_preferred)
+    message_id, words = await motivator.compose(habit, today, today)
+    assert "Зарядка" in words
+    assert bot.storage.get_motivation_message(42, message_id).source == "preset"
+
+    text, markup = reminder_message(habit, today, (message_id, words))
+    assert f"<i>{words}</i>" in text
+    assert [[b.text for b in row] for row in markup.inline_keyboard] == [
+        ["✅ Сделано", "Не сделано"],
+        ["🪶 Мягче", "👍 Принято", "💥 Жёстче"],
+    ]
+    labels = {b.text: b.callback_data for row in markup.inline_keyboard for b in row}
+
+    # Ответ: кнопки ответа уходят, мотивация и кнопки отзыва остаются.
+    answered = (await bot.press(labels["✅ Сделано"], markup=markup))[0]
+    assert "Отмечено" in answered.text and f"<i>{words}</i>" in answered.text
+    assert rows(answered) == [["🪶 Мягче", "👍 Принято", "💥 Жёстче"], ["☰ Меню"]]
+    # Привычку отметили после сообщения — оно засчитывается стилю.
+    assert bot.storage.get_motivation_message(42, message_id).acted
+    assert bot.storage.motivation_stats(42) == {"support": (1, 1, 0)}
+
+    # «Жёстче» сдвигает тон и убирает кнопки отзыва; повторный отзыв не принимается.
+    calls = await bot.press(labels["💥 Жёстче"], markup=answered.reply_markup)
+    assert [[b.text for b in row] for row in calls[0].reply_markup.inline_keyboard] == [["☰ Меню"]]
+    assert calls[-1].text == "Понял, буду жёстче"
+    assert bot.storage.get_motivation(42).tone == 1
+    assert bot.storage.get_motivation_message(42, message_id).feedback == "harder"
+    calls = await bot.press(labels["🪶 Мягче"], markup=markup)
+    assert calls[-1].text == "Отзыв уже учтён" and bot.storage.get_motivation(42).tone == 1
+
+
+async def test_motivation_off_or_foreign_message(bot: Harness) -> None:
+    await add(bot, "Зарядка", "Полезная", "💪", "08:00")
+    [habit] = bot.storage.list_habits(42)
+    today = datetime.now().date()
+    assert await Motivator(bot.storage, api_key="").compose(habit, today, today) is None
+    # Чужое сообщение отзывом не меняется.
+    bot.storage.set_motivation_style(42, "streak")
+    message_id, _ = await Motivator(bot.storage, api_key="").compose(habit, today, today)
+    assert not bot.storage.set_motivation_feedback(7, message_id, "ok")
+    assert bot.storage.get_motivation_message(7, message_id) is None

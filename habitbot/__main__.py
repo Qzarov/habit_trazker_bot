@@ -14,6 +14,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from . import reminders
 from .bot import COMMANDS, build_router, send_reminder
 from .db import Storage
+from .motivation import DEFAULT_MODEL, Motivator
 
 
 def load_env(path: Path) -> None:
@@ -46,8 +47,15 @@ async def main() -> None:
     dispatcher.include_router(build_router(storage))
     await bot.set_my_commands(COMMANDS)
 
+    # Без ключа OpenRouter мотивация всё равно работает — на готовых фразах.
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    model = os.environ.get("OPENROUTER_MODEL", "").strip() or DEFAULT_MODEL
+    motivator = Motivator(storage, api_key, model)
+    logging.getLogger(__name__).info(
+        "motivation: %s", f"openrouter {model}" if api_key else "presets only"
+    )
     loop = asyncio.create_task(
-        reminders.run(storage, lambda habit, day: send_reminder(bot, habit, day))
+        reminders.run(storage, lambda habit, day: send_reminder(bot, habit, day, motivator))
     )
     try:
         await dispatcher.start_polling(bot)

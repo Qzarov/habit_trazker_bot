@@ -41,11 +41,12 @@ def migrate(sqlite_path: str, database_url: str) -> dict[str, int]:
                     tuple(row),
                 )
             copied[table] = len(rows)
-        # Счётчик идентификаторов привычек продолжает с наибольшего перенесённого.
-        target.raw.execute(
-            "SELECT setval(pg_get_serial_sequence('habits', 'id'), "
-            "COALESCE((SELECT MAX(id) FROM habits), 0) + 1, false)"
-        )
+        # Счётчики идентификаторов продолжают с наибольшего перенесённого.
+        for table in ("habits", "motivation_messages"):
+            target.raw.execute(
+                f"SELECT setval(pg_get_serial_sequence('{table}', 'id'), "
+                f"COALESCE((SELECT MAX(id) FROM {table}), 0) + 1, false)"
+            )
 
     for table in TABLES:
         actual = target.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()["n"]
