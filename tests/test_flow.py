@@ -148,7 +148,15 @@ async def test_start_shows_inline_menu_and_drops_old_keyboard(bot: Harness) -> N
 async def test_start_asks_motivation_style_once(bot: Harness) -> None:
     await bot.say("/start")
     question = bot.session.calls[-1]
-    assert [len(row) for row in rows(question)] == [2, 2, 2, 1, 1]
+    assert [len(row) for row in rows(question)] == [2, 2, 2, 1, 1, 1]
+    # «Подробнее о стилях»: описание и пример у каждого стиля, выбрать можно прямо оттуда.
+    info = (await bot.press(buttons(question)["ℹ️ Подробнее о стилях"]))[0]
+    assert "<b>Стили мотивации</b>" in info.text
+    assert info.text.count("<i>«") == 6 and "Подбирай сам" in info.text
+    back = (await bot.press(buttons(info)["← Назад"]))[0]
+    assert back.text == question.text and rows(back) == rows(question)
+    info = (await bot.press(buttons(question)["ℹ️ Подробнее о стилях"]))[0]
+    question = info  # выбираем с экрана подробностей
     done = (await bot.press(buttons(question)["🔥 Серии"]))[0]
     assert bot.storage.get_motivation(42).style == "streak"
     assert "Готово: стиль «серии»" in done.text
@@ -669,6 +677,12 @@ async def test_motivation_settings(bot: Harness) -> None:
     screen = (await bot.press("n:mot"))[0]
     assert "Стиль: <b>выключена</b>" in screen.text
     assert "🔕 Выключить" not in buttons(screen)
+    # Подробнее о стилях — и обратно к настройкам.
+    info = (await bot.press(buttons(screen)["ℹ️ Подробнее о стилях"]))[0]
+    assert "«Неделю назад было 2 из 7, сейчас 5»" in info.text
+    assert list(buttons(info)) == ["← Назад"]
+    screen = (await bot.press(buttons(info)["← Назад"]))[0]
+    assert "Стиль: <b>выключена</b>" in screen.text
 
     screen = (await bot.press(buttons(screen)["🔥 Серии"]))[0]
     assert "Стиль: <b>серии</b>" in screen.text and "✔️ 🔥 Серии" in buttons(screen)

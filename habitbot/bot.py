@@ -41,7 +41,7 @@ from .calendar_image import (
     shift_month,
 )
 from .db import BAD, GOOD, Habit, Storage, best_clean_streak, streak
-from .motivation import AUTO, OFFERED, STYLES, Motivator
+from .motivation import ABOUT, AUTO, OFFERED, STYLES, Motivator
 from .reminders import parse_time, zone
 
 log = logging.getLogger(__name__)
@@ -226,7 +226,9 @@ class FbCb(CallbackData, prefix="f"):
 
 
 class MotCb(CallbackData, prefix="v"):
-    action: str  # style | off | why | nowhy | pick | skip (pick и skip — вопрос на старте)
+    # style | off | why | nowhy — экран настроек; pick | skip | ask — вопрос на старте;
+    # info — пояснения к стилям (value: start — из вопроса на старте, иначе из настроек)
+    action: str
     value: str = ""
 
 
@@ -1118,6 +1120,15 @@ def build_router(storage: Storage) -> Router:
         "«Мягче» и «Жёстче» под каждым сообщением."
     )
 
+    @router.callback_query(MotCb.filter(F.action.in_({"info", "ask"})))
+    async def show_styles_info(query: CallbackQuery, callback_data: MotCb) -> None:
+        if callback_data.action == "ask":
+            text, kb = motivation_question()
+        else:
+            text, kb = styles_info(from_start=callback_data.value == "start")
+        await query.message.edit_text(text, reply_markup=kb)
+        await query.answer()
+
     @router.callback_query(MotCb.filter(F.action.in_({"pick", "skip"})))
     async def answer_motivation_question(query: CallbackQuery, callback_data: MotCb) -> None:
         user_id = query.from_user.id
@@ -1182,7 +1193,8 @@ def build_router(storage: Storage) -> Router:
         auto = "✔️ " if motivation.style == AUTO else ""
         kb.button(text=f"{auto}🎲 Подбирай сам", callback_data=MotCb(action="style", value=AUTO))
         kb.button(text="✍️ Зачем мне это", callback_data=MotCb(action="why"))
-        rows = [2, 2, 2, 1, 1]
+        kb.button(text=BTN_ABOUT_STYLES, callback_data=MotCb(action="info"))
+        rows = [2, 2, 2, 1, 1, 1]
         if motivation.style is not None:
             kb.button(text="🔕 Выключить", callback_data=MotCb(action="off"))
             rows.append(1)
@@ -1536,14 +1548,42 @@ def parse_tz(text: str) -> str | None:
     return value
 
 
+BTN_ABOUT_STYLES = "ℹ️ Подробнее о стилях"
+
+
+def styles_info(from_start: bool) -> tuple[str, InlineKeyboardMarkup]:
+    """Пояснения к стилям с примерами. Из вопроса на старте стиль можно выбрать прямо здесь;
+    из настроек — вернуться к ним."""
+    lines = ["<b>Стили мотивации</b>"]
+    for name in OFFERED:
+        about, example = ABOUT[name]
+        lines.append(f"\n{STYLES[name].label} — {about}.\n<i>«{example}»</i>")
+    lines.append(
+        "\n🎲 <b>Подбирай сам</b> — я пробую разные стили и чаще пишу в тех, после которых ты "
+        "отмечаешь привычку.\n\nВ любом стиле я иногда пробую другие — так находится то, что "
+        "работает. Тон подстраивается кнопками «Мягче» и «Жёстче» под сообщениями."
+    )
+    kb = InlineKeyboardBuilder()
+    if from_start:
+        for name in OFFERED:
+            kb.button(text=STYLES[name].label, callback_data=MotCb(action="pick", value=name))
+        kb.button(text="🎲 Подбирай сам", callback_data=MotCb(action="pick", value=AUTO))
+        kb.button(text="← Назад", callback_data=MotCb(action="ask"))
+        kb.adjust(2, 2, 2, 1, 1)
+    else:
+        kb.button(text="← Назад", callback_data=NavCb(action="mot"))
+    return "\n".join(lines), kb.as_markup()
+
+
 def motivation_question() -> tuple[str, InlineKeyboardMarkup]:
     """Вопрос о стиле мотивации при первом запуске."""
     kb = InlineKeyboardBuilder()
     for name in OFFERED:
         kb.button(text=STYLES[name].label, callback_data=MotCb(action="pick", value=name))
     kb.button(text="🎲 Подбирай сам", callback_data=MotCb(action="pick", value=AUTO))
+    kb.button(text=BTN_ABOUT_STYLES, callback_data=MotCb(action="info", value="start"))
     kb.button(text="Пропустить", callback_data=MotCb(action="skip"))
-    kb.adjust(2, 2, 2, 1, 1)
+    kb.adjust(2, 2, 2, 1, 1, 1)
     text = (
         "<b>Что тебя мотивирует?</b>\n"
         "К напоминаниям я могу добавлять короткое сообщение в близком тебе стиле:\n"
