@@ -139,9 +139,39 @@ async def add(bot: Harness, name: str, kind: str, emoji: str, time: str | None =
 
 async def test_start_shows_inline_menu_and_drops_old_keyboard(bot: Harness) -> None:
     await bot.say("/start")
-    greeting, menu = bot.session.calls[-2:]
+    greeting, menu, question = bot.session.calls[-3:]
     assert type(greeting.reply_markup).__name__ == "ReplyKeyboardRemove"
     assert list(buttons(menu)) == MENU
+    assert "Что тебя мотивирует?" in question.text
+
+
+async def test_start_asks_motivation_style_once(bot: Harness) -> None:
+    await bot.say("/start")
+    question = bot.session.calls[-1]
+    assert [len(row) for row in rows(question)] == [2, 2, 2, 1, 1]
+    done = (await bot.press(buttons(question)["🔥 Серии"]))[0]
+    assert bot.storage.get_motivation(42).style == "streak"
+    assert "Готово: стиль «серии»" in done.text
+    assert "«☰ Меню» → «🔥 Мотивация»" in done.text and "Мягче" in done.text
+    assert list(buttons(done)) == ["☰ Меню"]
+
+    # Второй раз не спрашиваем.
+    await bot.say("/start")
+    assert "Что тебя мотивирует?" not in bot.session.calls[-1].text
+
+
+async def test_start_question_can_be_skipped(bot: Harness) -> None:
+    await bot.say("/start")
+    skipped = (await bot.press(buttons(bot.session.calls[-1])["Пропустить"]))[0]
+    assert "без мотивации" in skipped.text and "«🔥 Мотивация»" in skipped.text
+    assert bot.storage.get_motivation(42).style is None
+    # Пропуск — тоже ответ: при следующем запуске не спрашиваем.
+    await bot.say("/start")
+    assert "Что тебя мотивирует?" not in bot.session.calls[-1].text
+
+    # «Подбирай сам» из вопроса — у другого пользователя, пришедшего до появления мотивации.
+    bot.storage.register(77)
+    assert bot.storage.ask_motivation_once(77) and not bot.storage.ask_motivation_once(77)
 
 
 async def test_every_screen_leads_back_to_menu(bot: Harness) -> None:
@@ -709,3 +739,39 @@ async def test_motivation_off_or_foreign_message(bot: Harness) -> None:
     message_id, _ = await Motivator(bot.storage, api_key="").compose(habit, today, today)
     assert not bot.storage.set_motivation_feedback(7, message_id, "ok")
     assert bot.storage.get_motivation_message(7, message_id) is None
+
+
+async def test_broadcast_motivation_question(bot: Harness) -> None:
+    from aiogram.exceptions import TelegramForbiddenError
+    from aiogram.methods import SendMessage
+
+    from habitbot.ask_motivation import broadcast
+
+    storage = bot.storage
+    for user_id in (1, 2, 3, 4):
+        storage.register(user_id)
+    storage.set_motivation_style(2, "streak")  # уже выбрал — не спрашиваем
+    storage.ask_motivation_once(3)  # уже спросили на /start
+    blocked = 4
+
+    class Recorder:
+        def __init__(self) -> None:
+            self.sent: list[int] = []
+
+        async def send_message(self, chat_id, text, reply_markup=None):
+            if chat_id == blocked:
+                raise TelegramForbiddenError(SendMessage(chat_id=chat_id, text=text), "blocked")
+            self.sent.append(chat_id)
+
+    recorder = Recorder()
+    assert await broadcast(storage, recorder, send=False) == {
+        "sent": 0, "blocked": 0, "failed": 0, "total": 2,
+    }  # fmt: skip
+    assert recorder.sent == []
+    assert await broadcast(storage, recorder, send=True) == {
+        "sent": 1, "blocked": 1, "failed": 0, "total": 2,
+    }  # fmt: skip
+    assert recorder.sent == [1]
+    # Повторный запуск никого не трогает, /start вопрос тоже не повторит.
+    assert (await broadcast(storage, recorder, send=True))["total"] == 0
+    assert not storage.ask_motivation_once(1)

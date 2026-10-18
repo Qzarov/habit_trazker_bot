@@ -226,7 +226,7 @@ class FbCb(CallbackData, prefix="f"):
 
 
 class MotCb(CallbackData, prefix="v"):
-    action: str  # style | off | why | nowhy
+    action: str  # style | off | why | nowhy | pick | skip (pick и skip — вопрос на старте)
     value: str = ""
 
 
@@ -620,6 +620,10 @@ def build_router(storage: Storage) -> Router:
         # Первым сообщением убираем клавиатуру прежних версий, если она осталась на экране.
         await message.answer("Привет! " + HELP, reply_markup=ReplyKeyboardRemove())
         await message.answer(MENU_TEXT, reply_markup=main_menu())
+        # Стиль мотивации спрашиваем один раз; уже выбравшим — не спрашиваем.
+        if storage.get_motivation(user_id).style is None and storage.ask_motivation_once(user_id):
+            text, kb = motivation_question()
+            await message.answer(text, reply_markup=kb)
 
     @router.message(Command("help"))
     async def help_(message: Message, state: FSMContext) -> None:
@@ -1107,6 +1111,38 @@ def build_router(storage: Storage) -> Router:
             if any((b.callback_data or "").startswith("f:") for b in row)
         ]
 
+    #: Как поменять мотивацию — после ответа на вопрос при первом запуске.
+    MOTIVATION_HOW_TO = (
+        f"Поменять стиль, написать, зачем тебе это, или выключить мотивацию — "
+        f"в меню: «{BTN_MENU}» → «{BTN_MOTIVATION}». А тон подстраивается кнопками "
+        "«Мягче» и «Жёстче» под каждым сообщением."
+    )
+
+    @router.callback_query(MotCb.filter(F.action.in_({"pick", "skip"})))
+    async def answer_motivation_question(query: CallbackQuery, callback_data: MotCb) -> None:
+        user_id = query.from_user.id
+        if callback_data.action == "skip":
+            text = (
+                "Хорошо, напоминания будут без мотивации.\n"
+                f"Включить её можно в любой момент: «{BTN_MENU}» → «{BTN_MOTIVATION}»."
+            )
+        elif callback_data.value in STYLES or callback_data.value == AUTO:
+            storage.set_motivation_style(user_id, callback_data.value)
+            chosen = (
+                "буду подбирать сам"
+                if callback_data.value == AUTO
+                else f"стиль «{STYLES[callback_data.value].title}»"
+            )
+            text = (
+                f"Готово: {chosen}. Мотивация придёт с ближайшим напоминанием.\n\n"
+                f"{MOTIVATION_HOW_TO}"
+            )
+        else:
+            await query.answer()
+            return
+        await query.message.edit_text(text, reply_markup=only_menu())
+        await query.answer()
+
     def motivation_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         motivation = storage.get_motivation(user_id)
         if motivation.style is None:
@@ -1498,6 +1534,24 @@ def parse_tz(text: str) -> str | None:
     except (ZoneInfoNotFoundError, ValueError, OSError):
         return None
     return value
+
+
+def motivation_question() -> tuple[str, InlineKeyboardMarkup]:
+    """Вопрос о стиле мотивации при первом запуске."""
+    kb = InlineKeyboardBuilder()
+    for name in OFFERED:
+        kb.button(text=STYLES[name].label, callback_data=MotCb(action="pick", value=name))
+    kb.button(text="🎲 Подбирай сам", callback_data=MotCb(action="pick", value=AUTO))
+    kb.button(text="Пропустить", callback_data=MotCb(action="skip"))
+    kb.adjust(2, 2, 2, 1, 1)
+    text = (
+        "<b>Что тебя мотивирует?</b>\n"
+        "К напоминаниям я могу добавлять короткое сообщение в близком тебе стиле:\n"
+        "📈 цифры и прогресс · 🔥 серии дней · 🤝 поддержка · 🧭 смысл, зачем тебе это · "
+        "🪞 «я такой человек» · ✨ интерес и новизна.\n"
+        "Не знаешь — выбери «Подбирай сам»: я буду пробовать разное и смотреть, что работает."
+    )
+    return text, kb.as_markup()
 
 
 def reminder_message(
