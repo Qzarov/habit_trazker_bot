@@ -508,15 +508,23 @@ async def test_reminder_is_switched_off_and_on_keeping_time(bot: Harness) -> Non
     assert rows(screen)[2:] == [["Когда: сегодня"], ["← К привычке"]]
 
 
-async def test_emoji_palette_has_three_rows(bot: Harness) -> None:
+async def test_emoji_palette_has_four_rows(bot: Harness) -> None:
     await bot.press("n:add")
     kinds = buttons(await bot.say("Прогулка"))
     palette = (await bot.press(find(kinds, "Полезная")))[0]
-    assert [len(row) for row in rows(palette)] == [6, 6, 6, 1]
-    # Эмодзи из нового, третьего ряда выбирается как любой другой.
-    times = buttons((await bot.press(buttons(palette)["🚶"]))[0])
+    assert [len(row) for row in rows(palette)] == [6, 6, 6, 6, 1]
+    # Эмодзи из нового, четвёртого ряда выбирается как любой другой.
+    times = buttons((await bot.press(buttons(palette)["🌅"]))[0])
     card = (await bot.press(find(times, "Без напоминания")))[0]
-    assert "🚶 <b>Прогулка</b>" in card.text
+    assert "🌅 <b>Прогулка</b>" in card.text
+
+    await bot.press("n:add")
+    kinds = buttons(await bot.say("Накрутка"))
+    palette = (await bot.press(find(kinds, "Вредная")))[0]
+    assert [len(row) for row in rows(palette)] == [6, 6, 6, 6, 1]
+    times = buttons((await bot.press(buttons(palette)["🤯"]))[0])
+    card = (await bot.press(find(times, "Без напоминания")))[0]
+    assert "🤯 <b>Накрутка</b>" in card.text
 
 
 async def test_reminder_buttons_sent_before_update_still_work(bot: Harness) -> None:
