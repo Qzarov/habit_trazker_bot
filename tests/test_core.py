@@ -304,15 +304,22 @@ async def _run_tick(storage: Storage, now: datetime) -> list[str]:
     return sent
 
 
-async def test_tick_sends_once_and_skips_done(storage: Storage) -> None:
+async def test_tick_sends_once_and_skips_answered(storage: Storage) -> None:
     good = storage.add_habit(1, "Зарядка", GOOD, "08:00", TODAY)
     storage.add_habit(1, "Сладкое", BAD, "08:00", TODAY)
     done = storage.add_habit(1, "Вода", GOOD, "08:00", TODAY)
+    not_done = storage.add_habit(1, "Растяжка", GOOD, "08:00", TODAY)
+    clean = storage.add_habit(1, "Кофе", BAD, "08:00", TODAY)
+    slipped = storage.add_habit(1, "Чипсы", BAD, "08:00", TODAY)
     storage.add_habit(1, "Чтение", GOOD, "21:00", TODAY)
+    # Ответили сами — любым ответом, у полезных и у вредных.
     storage.set_answer(done.id, TODAY, True)
+    storage.set_answer(not_done.id, TODAY, False)
+    storage.set_answer(clean.id, TODAY, False)
+    storage.set_answer(slipped.id, TODAY, True)
     now = datetime(2026, 10, 11, 5, 0, tzinfo=ZoneInfo("UTC"))  # 08:00 по Москве
 
-    # Сделанную полезную не дёргаем; вредную спрашиваем всегда; «Чтению» ещё рано.
+    # Напоминают только привычки без ответа за сегодня; «Чтению» ещё рано.
     assert await _run_tick(storage, now) == ["Зарядка", "Сладкое"]
     assert await _run_tick(storage, now) == []
     assert storage.get_habit(1, good.id).last_reminded == TODAY

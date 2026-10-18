@@ -75,17 +75,14 @@ async def tick(
             continue
         # Отмечаем до отправки: упавшая отправка не должна слать одно и то же каждые полминуты.
         storage.mark_reminded(habit.id, now.date())
-        if habit.remind_next_day:
-            # Спрашиваем про вчерашний день. Он уже закончился, поэтому любой ответ за него
-            # окончательный — второй раз не спрашиваем; до заведения привычки спрашивать не о чем.
-            day = now.date() - timedelta(days=1)
-            if day < habit.created_on or storage.get_answer(habit.id, day) is not None:
-                continue
-        else:
-            day = now.date()
-            # Полезную привычку, которую сегодня уже отметили, не дёргаем.
-            if not habit.is_bad and storage.is_marked(habit.id, day):
-                continue
+        # Напоминание про вчерашний день, если оно «на следующий день», иначе — про сегодняшний.
+        day = now.date() - timedelta(days=1) if habit.remind_next_day else now.date()
+        # До заведения привычки спрашивать не о чем.
+        if day < habit.created_on:
+            continue
+        # Человек уже ответил сам — любым ответом, у полезной и у вредной: не дёргаем.
+        if storage.get_answer(habit.id, day) is not None:
+            continue
         try:
             await send(habit, day)
             sent += 1
