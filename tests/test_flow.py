@@ -217,11 +217,12 @@ async def test_card_has_one_answer_button_per_day(bot: Harness) -> None:
     today = datetime.now().date()
     yesterday = today - timedelta(days=1)
     assert "Сегодня: <b>нет данных</b>" in card.text
-    # Привычка заведена сегодня — кнопка одна; удаления на карточке нет.
+    # Привычка заведена сегодня — кнопка одна.
     assert rows(card) == [
         ["▫️ Сегодня: нет данных"],
         ["📅 Календарь", "⏰ Напоминание"],
-        ["🎨 Эмодзи", "← К списку"],
+        ["🎨 Эмодзи", "🗑 Удалить"],
+        ["← К списку"],
     ]
 
     # Нажатие меняет ответ по кругу, подпись и значок кнопки меняются вместе с ним.
@@ -258,10 +259,26 @@ async def test_card_buttons_sent_before_update_still_work(bot: Harness) -> None:
     today = datetime.now().date()
     await bot.press(f"m:{habit.id}:0:c:0")  # прежняя кнопка «Сегодня: не было»
     assert bot.storage.all_answers(habit.id) == {today: False}
-    # Удаление с карточки убрано, но кнопка на старом сообщении по-прежнему работает.
-    confirm = buttons((await bot.press(f"h:del:{habit.id}"))[0])
-    await bot.press(find(confirm, "Да, удалить"))
-    assert bot.storage.list_habits(42) == []
+
+
+async def test_delete_from_card(bot: Harness) -> None:
+    card = buttons(await add(bot, "Сладкое", "Вредная", "🍬"))
+    await add(bot, "Зарядка", "Полезная", "💪")
+    sweets = bot.storage.list_habits(42)[0]
+
+    # «Оставить» возвращает на карточку, привычка на месте.
+    confirm = (await bot.press(card["🗑 Удалить"]))[0]
+    assert "Удалить «Сладкое»?" in confirm.text
+    back = (await bot.press(buttons(confirm)["Оставить"]))[0]
+    assert "<b>Сладкое</b>" in back.text and len(bot.storage.list_habits(42)) == 2
+
+    # «Да, удалить» — привычка пропадает из списка и напоминаний, экран — список.
+    bot.storage.set_reminder(42, sweets.id, "08:00")
+    confirm = (await bot.press(card["🗑 Удалить"]))[0]
+    listing = (await bot.press(buttons(confirm)["Да, удалить"]))[0]
+    assert listing.text.startswith("Удалено.") and "Сладкое" not in listing.text
+    assert [h.name for h in bot.storage.list_habits(42)] == ["Зарядка"]
+    assert all(h.id != sweets.id for h in bot.storage.habits_with_reminders())
 
 
 async def test_own_emoji_and_typed_time(bot: Harness) -> None:
@@ -337,8 +354,6 @@ async def test_calendar_edit_any_past_day_and_delete(bot: Harness) -> None:
     # «Меню» под картинкой присылает меню новым сообщением.
     menu = (await bot.press("n:menu", photo=True))[0]
     assert type(menu).__name__ == "SendMessage" and list(buttons(menu)) == MENU
-
-    assert not any("Удалить" in text for text in buttons(card))
 
 
 async def test_two_columns_and_add_next_to_menu(bot: Harness) -> None:
@@ -725,30 +740,63 @@ async def test_reminder_with_motivation_and_feedback(bot: Harness) -> None:
     assert "Зарядка" in words
     assert bot.storage.get_motivation_message(42, message_id).source == "preset"
 
+    # В напоминании — текст, мотивация и только кнопки ответа.
     text, markup = reminder_message(habit, today, (message_id, words))
     assert f"<i>{words}</i>" in text
     assert [[b.text for b in row] for row in markup.inline_keyboard] == [
-        ["✅ Сделано", "Не сделано"],
-        ["🪶 Мягче", "👍 Принято", "💥 Жёстче"],
+        ["✅ Сделано", "Не сделано"]
     ]
     labels = {b.text: b.callback_data for row in markup.inline_keyboard for b in row}
 
-    # Ответ: кнопки ответа уходят, мотивация и кнопки отзыва остаются.
-    answered = (await bot.press(labels["✅ Сделано"], markup=markup))[0]
+    # Ответ: кнопки ответа уходят, мотивация остаётся, вопрос о ней приходит новым сообщением.
+    calls = await bot.press(labels["✅ Сделано"], markup=markup)
+    answered = calls[0]
     assert "Отмечено" in answered.text and f"<i>{words}</i>" in answered.text
-    assert rows(answered) == [["🪶 Мягче", "👍 Принято", "💥 Жёстче"], ["☰ Меню"]]
+    assert rows(answered) == [["☰ Меню"]]
+    question = calls[-1]
+    assert type(question).__name__ == "SendMessage"
+    assert question.text.startswith("Как тебе такая мотивация?")
+    assert rows(question) == [["🪶 Мягче", "👍 Принято", "💥 Жёстче"]]
     # Привычку отметили после сообщения — оно засчитывается стилю.
     assert bot.storage.get_motivation_message(42, message_id).acted
     assert bot.storage.motivation_stats(42) == {"support": (1, 1, 0)}
 
-    # «Жёстче» сдвигает тон и убирает кнопки отзыва; повторный отзыв не принимается.
-    calls = await bot.press(labels["💥 Жёстче"], markup=answered.reply_markup)
-    assert [[b.text for b in row] for row in calls[0].reply_markup.inline_keyboard] == [["☰ Меню"]]
+    # «Жёстче» сдвигает тон, кнопки вопроса сменяются ответом; повторный отзыв не принимается.
+    rate = buttons(question)
+    calls = await bot.press(rate["💥 Жёстче"], markup=question.reply_markup)
+    assert calls[0].text == "Как тебе такая мотивация? — 💥 Жёстче"
     assert calls[-1].text == "Понял, буду жёстче"
     assert bot.storage.get_motivation(42).tone == 1
     assert bot.storage.get_motivation_message(42, message_id).feedback == "harder"
-    calls = await bot.press(labels["🪶 Мягче"], markup=markup)
+    calls = await bot.press(rate["🪶 Мягче"], markup=question.reply_markup)
     assert calls[-1].text == "Отзыв уже учтён" and bot.storage.get_motivation(42).tone == 1
+
+    # Повторный ответ на то же напоминание (кнопка из другого клиента) вопрос не присылает:
+    # отзыв уже дан.
+    calls = await bot.press(labels["Не сделано"], markup=markup)
+    assert not any(type(c).__name__ == "SendMessage" for c in calls)
+
+
+async def test_reminder_sent_before_update_keeps_feedback_buttons(bot: Harness) -> None:
+    await add(bot, "Зарядка", "Полезная", "💪", "08:00")
+    [habit] = bot.storage.list_habits(42)
+    bot.storage.set_motivation_style(42, "support")
+    today = datetime.now().date()
+    message_id, words = await Motivator(bot.storage, api_key="").compose(habit, today, today)
+    # Напоминание прежнего вида: кнопки ответа `r:` и кнопки отзыва под ними.
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    stamp = today.strftime("%Y%m%d")
+    old = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Сделано", callback_data=f"r:{habit.id}:{stamp}:1")],
+            [InlineKeyboardButton(text="💥 Жёстче", callback_data=f"f:{message_id}:1")],
+        ]
+    )
+    calls = await bot.press(f"r:{habit.id}:{stamp}:1", markup=old)
+    assert f"<i>{words}</i>" in calls[0].text
+    assert rows(calls[0]) == [["💥 Жёстче"], ["☰ Меню"]]
+    assert not any(type(c).__name__ == "SendMessage" for c in calls)
 
 
 async def test_motivation_off_or_foreign_message(bot: Harness) -> None:

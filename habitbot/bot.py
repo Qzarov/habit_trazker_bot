@@ -220,6 +220,16 @@ class RemCb(CallbackData, prefix="r"):
     on: int  # 1 — «да», 0 — «нет»
 
 
+class RemFbCb(CallbackData, prefix="q"):
+    """Ответ на напоминание с мотивацией: после ответа приходит вопрос о ней. Отдельный класс,
+    а не поле в `RemCb`, — иначе перестанут разбираться кнопки уже присланных напоминаний."""
+
+    id: int
+    day: int  # ГГГГММДД
+    on: int  # 1 — «да», 0 — «нет»
+    m: int  # номер сообщения в журнале мотивации
+
+
 class FbCb(CallbackData, prefix="f"):
     """Отзыв о мотивационном сообщении."""
 
@@ -436,8 +446,9 @@ def build_router(storage: Storage) -> Router:
         kb.button(text="📅 Календарь", callback_data=HabitCb(action="cal", id=habit.id))
         kb.button(text="⏰ Напоминание", callback_data=HabitCb(action="rem", id=habit.id))
         kb.button(text="🎨 Эмодзи", callback_data=HabitCb(action="emoji", id=habit.id))
+        kb.button(text="🗑 Удалить", callback_data=HabitCb(action="del", id=habit.id))
         kb.button(text="← К списку", callback_data=HabitCb(action="list"))
-        kb.adjust(*([1] * len(days)), 2, 2)
+        kb.adjust(*([1] * len(days)), 2, 2, 1)
         return text, kb.as_markup()
 
     def calendar_view(
@@ -1092,7 +1103,8 @@ def build_router(storage: Storage) -> Router:
         kb.button(text="Да, удалить", callback_data=HabitCb(action="delok", id=habit.id))
         kb.button(text="Оставить", callback_data=HabitCb(action="open", id=habit.id))
         await query.message.edit_text(
-            f"Удалить «{escape(habit.name)}» вместе с отметками?", reply_markup=kb.as_markup()
+            f"Удалить «{escape(habit.name)}»? Она пропадёт из списка, календаря и напоминаний.",
+            reply_markup=kb.as_markup(),
         )
         await query.answer()
 
@@ -1119,7 +1131,7 @@ def build_router(storage: Storage) -> Router:
     MOTIVATION_HOW_TO = (
         f"Поменять стиль, написать, зачем тебе это, или выключить мотивацию — "
         f"в меню: «{BTN_MENU}» → «{BTN_MOTIVATION}». А тон подстраивается кнопками "
-        "«Мягче» и «Жёстче» под каждым сообщением."
+        "«Мягче» и «Жёстче»: после ответа на напоминание я спрошу, как тебе мотивация."
     )
 
     @router.callback_query(MotCb.filter(F.action.in_({"info", "ask"})))
@@ -1169,7 +1181,8 @@ def build_router(storage: Storage) -> Router:
             (
                 "К напоминаниям я добавляю короткое сообщение в стиле, который тебе ближе. "
                 "Иногда пробую другие стили и смотрю, после каких ты чаще отмечаешь привычку. "
-                "Под сообщением — «Мягче», «Принято» и «Жёстче»: по ним я подстраиваю тон."
+                "После ответа на напоминание спрашиваю, как тебе мотивация: «Мягче», «Принято» "
+                "или «Жёстче» — по ним я подстраиваю тон."
             ),
             "",
             f"Стиль: <b>{current}</b>",
@@ -1273,7 +1286,8 @@ def build_router(storage: Storage) -> Router:
         return "Отмечено ✅" if on else "Записал: не сделано"
 
     @router.callback_query(RemCb.filter())
-    async def answer_reminder(query: CallbackQuery, callback_data: RemCb) -> None:
+    @router.callback_query(RemFbCb.filter())
+    async def answer_reminder(query: CallbackQuery, callback_data: RemCb | RemFbCb) -> None:
         habit = await habit_or_alert(query, callback_data.id)
         if habit is None:
             return
@@ -1291,9 +1305,16 @@ def build_router(storage: Storage) -> Router:
         title = f"<b>{escape(habit.name)}</b>" + ("" if day == today else f" · {day:%d.%m}")
         text = f"{title}\n{note}\n{streak_line(habit, today)}"
         # Кнопки ответа больше не нужны; поправить ответ можно на карточке или в календаре.
-        # Мотивация остаётся в сообщении, а кнопки отзыва — пока отзыв не дали.
+        # Мотивация остаётся в сообщении; у напоминаний старого вида под ней остаются и кнопки
+        # отзыва — пока отзыв не дали.
         feedback = feedback_rows(query.message.reply_markup)
-        if feedback:
+        asked = getattr(callback_data, "m", 0)  # о мотивации спросим отдельным сообщением
+        message = None
+        if asked:
+            message = storage.get_motivation_message(habit.user_id, asked)
+            if message is not None:
+                text += f"\n\n<i>{escape(message.text)}</i>"
+        elif feedback:
             rated = FbCb.unpack(feedback[0][0].callback_data).id
             message = storage.get_motivation_message(habit.user_id, rated)
             if message is not None:
@@ -1304,23 +1325,30 @@ def build_router(storage: Storage) -> Router:
         kb.row(*only_menu().inline_keyboard[0])
         await query.message.edit_text(text, reply_markup=kb.as_markup())
         await query.answer(note)
+        if asked and message is not None and message.feedback is None:
+            question, markup = feedback_question(asked)
+            await query.message.answer(question, reply_markup=markup)
 
     @router.callback_query(FbCb.filter())
     async def rate_motivation(query: CallbackQuery, callback_data: FbCb) -> None:
         """Отзыв о мотивации: «мягче» и «жёстче» сдвигают тон следующих сообщений."""
         user_id = query.from_user.id
-        _, delta, value = next(f for f in FEEDBACK if f[1] == max(-1, min(1, callback_data.v)))
+        label, delta, value = next(f for f in FEEDBACK if f[1] == max(-1, min(1, callback_data.v)))
         fresh = storage.set_motivation_feedback(user_id, callback_data.id, value)
-        # Кнопки отзыва убираем в любом случае; остальные кнопки сообщения остаются.
+        # Кнопки отзыва убираем в любом случае; остальные кнопки сообщения остаются. В отдельном
+        # вопросе о мотивации других кнопок нет — там вместо них остаётся ответ.
         markup = query.message.reply_markup
         rows = [
             row
             for row in (markup.inline_keyboard if markup else [])
             if not any((b.callback_data or "").startswith("f:") for b in row)
         ]
-        await query.message.edit_reply_markup(
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-        )
+        if rows:
+            await query.message.edit_reply_markup(
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+            )
+        else:
+            await query.message.edit_text(f"Как тебе такая мотивация? — {label}")
         if not fresh:
             await query.answer("Отзыв уже учтён")
             return
@@ -1563,7 +1591,8 @@ def styles_info(from_start: bool) -> tuple[str, InlineKeyboardMarkup]:
     lines.append(
         "\n🎲 <b>Подбирай сам</b> — я пробую разные стили и чаще пишу в тех, после которых ты "
         "отмечаешь привычку.\n\nВ любом стиле я иногда пробую другие — так находится то, что "
-        "работает. Тон подстраивается кнопками «Мягче» и «Жёстче» под сообщениями."
+        "работает. Тон подстраивается кнопками «Мягче» и «Жёстче»: о мотивации я спрашиваю после "
+        "ответа на напоминание."
     )
     kb = InlineKeyboardBuilder()
     if from_start:
@@ -1601,33 +1630,44 @@ def reminder_message(
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Напоминание про день `day`: сегодняшний или, у напоминаний на следующий день, вчерашний.
 
-    `motivation` — номер и текст мотивационного сообщения: текст идёт под вопросом, под
-    кнопками ответа — кнопки отзыва.
+    `motivation` — номер и текст мотивационного сообщения: текст идёт под вопросом, а вопрос
+    о мотивации приходит отдельным сообщением после ответа.
     """
     stamp = int(day.strftime("%Y%m%d"))
     title = f"{habit.icon} <b>{escape(habit.name)}</b>"
     kb = InlineKeyboardBuilder()
+
+    def answer(on: int) -> CallbackData:
+        if motivation is None:
+            return RemCb(id=habit.id, day=stamp, on=on)
+        return RemFbCb(id=habit.id, day=stamp, on=on, m=motivation[0])
+
     if habit.is_bad:
-        kb.button(text="Не было 💪", callback_data=RemCb(id=habit.id, day=stamp, on=0))
-        kb.button(text="Было", callback_data=RemCb(id=habit.id, day=stamp, on=1))
+        kb.button(text="Не было 💪", callback_data=answer(0))
+        kb.button(text="Было", callback_data=answer(1))
         question = (
             f"как прошёл вчерашний день ({day:%d.%m})?" if habit.remind_next_day else "как сегодня?"
         )
         text = f"⏰ {title} — {question}"
     else:
-        kb.button(text="✅ Сделано", callback_data=RemCb(id=habit.id, day=stamp, on=1))
-        kb.button(text="Не сделано", callback_data=RemCb(id=habit.id, day=stamp, on=0))
+        kb.button(text="✅ Сделано", callback_data=answer(1))
+        kb.button(text="Не сделано", callback_data=answer(0))
         if habit.remind_next_day:
             text = f"⏰ {title} — получилось вчера ({day:%d.%m})?"
         else:
             text = f"⏰ Пора: {title}"
     if motivation is None:
         return text, kb.as_markup()
-    message_id, words = motivation
+    return f"{text}\n\n<i>{escape(motivation[1])}</i>", kb.as_markup()
+
+
+def feedback_question(message_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Вопрос о мотивации — отдельным сообщением после ответа на напоминание."""
+    kb = InlineKeyboardBuilder()
     for label, delta, _ in FEEDBACK:
         kb.button(text=label, callback_data=FbCb(id=message_id, v=delta))
-    kb.adjust(2, 3)
-    return f"{text}\n\n<i>{escape(words)}</i>", kb.as_markup()
+    kb.adjust(3)
+    return "Как тебе такая мотивация? Отметь кнопкой — я подстрою тон.", kb.as_markup()
 
 
 async def send_reminder(
