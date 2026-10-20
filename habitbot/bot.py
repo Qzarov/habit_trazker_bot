@@ -12,6 +12,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
@@ -29,6 +30,7 @@ from aiogram.types import (
     LinkPreviewOptions,
     Message,
     ReplyKeyboardRemove,
+    ReplyParameters,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -68,7 +70,7 @@ BTN_MOTIVATION = "🔥 Мотивация"
 #: Тон мотивации коротко — для экрана настроек.
 TONE_WORDS = {-2: "очень мягко", -1: "мягко", 0: "обычный", 1: "бодро", 2: "жёстко"}
 #: Кнопки отзыва под мотивацией: подпись, сдвиг тона, что записать.
-FEEDBACK = [("🪶 Мягче", -1, "softer"), ("👍 Принято", 0, "ok"), ("💥 Жёстче", 1, "harder")]
+FEEDBACK = [("🪶 Мягче", -1, "softer"), ("👍 Хорошо", 0, "ok"), ("💥 Жёстче", 1, "harder")]
 MAX_WHY = 200
 
 SHARE_TEXT = "Веду привычки в этом боте — отметки, напоминания и календарь. Присоединяйся!"
@@ -1181,7 +1183,7 @@ def build_router(storage: Storage) -> Router:
             (
                 "К напоминаниям я добавляю короткое сообщение в стиле, который тебе ближе. "
                 "Иногда пробую другие стили и смотрю, после каких ты чаще отмечаешь привычку. "
-                "После ответа на напоминание спрашиваю, как тебе мотивация: «Мягче», «Принято» "
+                "После ответа на напоминание спрашиваю, как тебе мотивация: «Мягче», «Хорошо» "
                 "или «Жёстче» — по ним я подстраиваю тон."
             ),
             "",
@@ -1326,8 +1328,20 @@ def build_router(storage: Storage) -> Router:
         await query.message.edit_text(text, reply_markup=kb.as_markup())
         await query.answer(note)
         if asked and message is not None and message.feedback is None:
+            # Вопрос — ответом на напоминание, с цитатой мотивации. Если Telegram не найдёт
+            # цитату в тексте, вопрос уходит обычным ответом, без неё.
             question, markup = feedback_question(asked)
-            await query.message.answer(question, reply_markup=markup)
+            reply = ReplyParameters(
+                message_id=query.message.message_id, allow_sending_without_reply=True
+            )
+            try:
+                await query.message.answer(
+                    question,
+                    reply_markup=markup,
+                    reply_parameters=reply.model_copy(update={"quote": message.text}),
+                )
+            except TelegramBadRequest:
+                await query.message.answer(question, reply_markup=markup, reply_parameters=reply)
 
     @router.callback_query(FbCb.filter())
     async def rate_motivation(query: CallbackQuery, callback_data: FbCb) -> None:

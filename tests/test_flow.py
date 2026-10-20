@@ -756,7 +756,9 @@ async def test_reminder_with_motivation_and_feedback(bot: Harness) -> None:
     question = calls[-1]
     assert type(question).__name__ == "SendMessage"
     assert question.text.startswith("Как тебе такая мотивация?")
-    assert rows(question) == [["🪶 Мягче", "👍 Принято", "💥 Жёстче"]]
+    assert question.reply_parameters.message_id == 500  # ответ на само напоминание
+    assert question.reply_parameters.quote == words
+    assert rows(question) == [["🪶 Мягче", "👍 Хорошо", "💥 Жёстче"]]
     # Привычку отметили после сообщения — оно засчитывается стилю.
     assert bot.storage.get_motivation_message(42, message_id).acted
     assert bot.storage.motivation_stats(42) == {"support": (1, 1, 0)}
@@ -775,6 +777,34 @@ async def test_reminder_with_motivation_and_feedback(bot: Harness) -> None:
     # отзыв уже дан.
     calls = await bot.press(labels["Не сделано"], markup=markup)
     assert not any(type(c).__name__ == "SendMessage" for c in calls)
+
+
+async def test_feedback_question_without_quote_if_telegram_rejects_it(bot: Harness) -> None:
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import SendMessage
+
+    await add(bot, "Зарядка", "Полезная", "💪", "08:00")
+    [habit] = bot.storage.list_habits(42)
+    bot.storage.set_motivation_style(42, "support")
+    today = datetime.now().date()
+    motivation = await Motivator(bot.storage, api_key="").compose(habit, today, today)
+    _, markup = reminder_message(habit, today, motivation)
+
+    send = bot.session.make_request
+
+    async def reject_quote(b, method, timeout=None):
+        if isinstance(method, SendMessage) and method.reply_parameters.quote:
+            raise TelegramBadRequest(method=method, message="QUOTE_TEXT_INVALID")
+        return await send(b, method, timeout)
+
+    bot.session.make_request = reject_quote
+    calls = await bot.press(
+        {b.text: b.callback_data for row in markup.inline_keyboard for b in row}["✅ Сделано"],
+        markup=markup,
+    )
+    question = calls[-1]
+    assert question.text.startswith("Как тебе такая мотивация?")
+    assert question.reply_parameters.message_id == 500 and question.reply_parameters.quote is None
 
 
 async def test_reminder_sent_before_update_keeps_feedback_buttons(bot: Harness) -> None:
