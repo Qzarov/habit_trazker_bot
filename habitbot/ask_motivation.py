@@ -18,6 +18,7 @@ from pathlib import Path
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 
 from .__main__ import load_env
@@ -63,7 +64,12 @@ async def main(send: bool) -> None:
     storage = Storage(
         os.environ.get("DATABASE_URL", "").strip() or os.environ.get("HABIT_DB", "habits.db")
     )
-    bot = Bot(os.environ["BOT_TOKEN"].strip(), default=DefaultBotProperties(parse_mode="HTML"))
+    proxy = os.environ.get("PROXY_URL", "").strip() or None
+    bot = Bot(
+        os.environ["BOT_TOKEN"].strip(),
+        session=AiohttpSession(proxy=proxy) if proxy else None,
+        default=DefaultBotProperties(parse_mode="HTML"),
+    )
     try:
         counts = await broadcast(storage, bot, send)
     finally:

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from . import reminders
@@ -42,7 +43,14 @@ async def main() -> None:
         default_tz=os.environ.get("DEFAULT_TZ", "Europe/Moscow"),
     )
     logging.getLogger(__name__).info("storage: %s", "postgresql" if storage.postgres else "sqlite")
-    bot = Bot(token, default=DefaultBotProperties(parse_mode="HTML", link_preview_is_disabled=True))
+    # Прокси для Telegram и OpenRouter: с сервера в РФ они напрямую недоступны.
+    proxy = os.environ.get("PROXY_URL", "").strip() or None
+    logging.getLogger(__name__).info("proxy: %s", "on" if proxy else "off")
+    bot = Bot(
+        token,
+        session=AiohttpSession(proxy=proxy) if proxy else None,
+        default=DefaultBotProperties(parse_mode="HTML", link_preview_is_disabled=True),
+    )
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(build_router(storage))
     await bot.set_my_commands(COMMANDS)
@@ -50,7 +58,7 @@ async def main() -> None:
     # Без ключа OpenRouter мотивация всё равно работает — на готовых фразах.
     api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
     model = os.environ.get("OPENROUTER_MODEL", "").strip() or DEFAULT_MODEL
-    motivator = Motivator(storage, api_key, model)
+    motivator = Motivator(storage, api_key, model, proxy=proxy)
     logging.getLogger(__name__).info(
         "motivation: %s", f"openrouter {model}" if api_key else "presets only"
     )

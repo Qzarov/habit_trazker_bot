@@ -383,10 +383,12 @@ class Motivator:
         api_key: str,
         model: str = DEFAULT_MODEL,
         rng: random.Random | None = None,
+        proxy: str | None = None,
     ) -> None:
         self.storage = storage
         self.api_key = api_key
         self.model = model
+        self.proxy = proxy
         self.rng = rng or random.Random()
 
     async def complete(self, messages: list[dict[str, str]]) -> str | None:
@@ -407,7 +409,7 @@ class Motivator:
         try:
             async with (
                 aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as session,
-                session.post(OPENROUTER_URL, json=payload, headers=headers) as resp,
+                session.post(OPENROUTER_URL, json=payload, headers=headers, proxy=self.proxy) as resp,
             ):
                 data = await resp.json(content_type=None)
             if resp.status != 200:
