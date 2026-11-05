@@ -1318,18 +1318,18 @@ def build_router(storage: Storage) -> Router:
     def answered_view(
         habit: Habit, day: date, on: bool | None, motivation: MotivationMessage | None
     ) -> tuple[str, InlineKeyboardMarkup]:
-        """Напоминание после ответа: ответ и серия, мотивация с вопросом о ней; «Меню» и, пока
-        отзыва нет, кнопки отзыва."""
+        """Напоминание после ответа: ответ и серия, мотивация с вопросом о ней; пока отзыва нет,
+        кнопки отзыва, под ними «Меню»."""
         today = today_of(habit.user_id)
         title = f"<b>{escape(habit.name)}</b>" + ("" if day == today else f" · {day:%d.%m}")
         text = f"{title}\n{answer_note(habit, on, today=day == today)}\n{streak_line(habit, today)}"
         kb = InlineKeyboardBuilder()
-        menu_button(kb)
         if motivation is not None:
             text += motivation_tail(motivation.text, motivation.feedback)
             if motivation.feedback is None:
                 feedback_buttons(kb, motivation.id)
-        kb.adjust(1, 3)
+        menu_button(kb)
+        kb.adjust(3, 1)
         return text, kb.as_markup()
 
     async def show_feedback(query: CallbackQuery, message_id: int, label: str) -> None:

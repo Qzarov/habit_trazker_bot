@@ -761,7 +761,7 @@ async def test_reminder_with_motivation_and_feedback(bot: Harness) -> None:
     answered = calls[0]
     assert "Отмечено" in answered.text
     assert answered.text.endswith(f"<i>{words}</i>\n\nКак тебе такая мотивация?")
-    assert rows(answered) == [["☰ Меню"], ["🪶 Мягче", "👍 Хорошо", "💥 Жёстче"]]
+    assert rows(answered) == [["🪶 Мягче", "👍 Хорошо", "💥 Жёстче"], ["☰ Меню"]]
     # Привычку отметили после сообщения — оно засчитывается стилю.
     assert bot.storage.get_motivation_message(42, message_id).acted
     assert bot.storage.motivation_stats(42) == {"support": (1, 1, 0)}
@@ -853,7 +853,7 @@ async def test_reminder_sent_before_update_keeps_feedback_buttons(bot: Harness) 
     )
     calls = await bot.press(f"r:{habit.id}:{stamp}:1", markup=old)
     assert calls[0].text.endswith(f"<i>{words}</i>\n\nКак тебе такая мотивация?")
-    assert rows(calls[0]) == [["☰ Меню"], ["🪶 Мягче", "👍 Хорошо", "💥 Жёстче"]]
+    assert rows(calls[0]) == [["🪶 Мягче", "👍 Хорошо", "💥 Жёстче"], ["☰ Меню"]]
     assert not any(type(c).__name__ == "SendMessage" for c in calls)
 
 
