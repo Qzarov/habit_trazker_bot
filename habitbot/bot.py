@@ -12,7 +12,6 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.filters.callback_data import CallbackData
 from aiogram.fsm.context import FSMContext
@@ -30,7 +29,6 @@ from aiogram.types import (
     LinkPreviewOptions,
     Message,
     ReplyKeyboardRemove,
-    ReplyParameters,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -42,7 +40,7 @@ from .calendar_image import (
     render_overview,
     shift_month,
 )
-from .db import BAD, GOOD, Habit, Storage, best_clean_streak, streak
+from .db import BAD, GOOD, Habit, MotivationMessage, Storage, best_clean_streak, streak
 from .motivation import ABOUT, AUTO, OFFERED, STYLES, Motivator
 from .reminders import parse_time, zone
 
@@ -223,8 +221,9 @@ class RemCb(CallbackData, prefix="r"):
 
 
 class RemFbCb(CallbackData, prefix="q"):
-    """Ответ на напоминание с мотивацией: после ответа приходит вопрос о ней. Отдельный класс,
-    а не поле в `RemCb`, — иначе перестанут разбираться кнопки уже присланных напоминаний."""
+    """Ответ на напоминание с мотивацией: по номеру мотивации её текст и вопрос о ней остаются
+    в сообщении после ответа. Отдельный класс, а не поле в `RemCb`, — иначе перестанут
+    разбираться кнопки уже присланных напоминаний."""
 
     id: int
     day: int  # ГГГГММДД
@@ -1133,7 +1132,7 @@ def build_router(storage: Storage) -> Router:
     MOTIVATION_HOW_TO = (
         f"Поменять стиль, написать, зачем тебе это, или выключить мотивацию — "
         f"в меню: «{BTN_MENU}» → «{BTN_MOTIVATION}». А тон подстраивается кнопками "
-        "«Мягче» и «Жёстче»: после ответа на напоминание я спрошу, как тебе мотивация."
+        "«Мягче» и «Жёстче»: в конце напоминания я спрашиваю, как тебе мотивация."
     )
 
     @router.callback_query(MotCb.filter(F.action.in_({"info", "ask"})))
@@ -1303,45 +1302,67 @@ def build_router(storage: Storage) -> Router:
             return
         on = bool(callback_data.on)
         storage.set_answer(habit.id, day, on)
-        note = answer_note(habit, on, today=day == today)
-        title = f"<b>{escape(habit.name)}</b>" + ("" if day == today else f" · {day:%d.%m}")
-        text = f"{title}\n{note}\n{streak_line(habit, today)}"
         # Кнопки ответа больше не нужны; поправить ответ можно на карточке или в календаре.
-        # Мотивация остаётся в сообщении; у напоминаний старого вида под ней остаются и кнопки
-        # отзыва — пока отзыв не дали.
-        feedback = feedback_rows(query.message.reply_markup)
-        asked = getattr(callback_data, "m", 0)  # о мотивации спросим отдельным сообщением
-        message = None
-        if asked:
-            message = storage.get_motivation_message(habit.user_id, asked)
-            if message is not None:
-                text += f"\n\n<i>{escape(message.text)}</i>"
-        elif feedback:
-            rated = FbCb.unpack(feedback[0][0].callback_data).id
-            message = storage.get_motivation_message(habit.user_id, rated)
-            if message is not None:
-                text += f"\n\n<i>{escape(message.text)}</i>"
+        # Мотивация и вопрос о ней остаются в сообщении, кнопки отзыва — пока отзыв не дали.
+        # У напоминаний старого вида номер мотивации есть только в кнопках отзыва.
+        rated = getattr(callback_data, "m", 0)
+        if not rated:
+            feedback = feedback_rows(query.message.reply_markup)
+            if feedback:
+                rated = FbCb.unpack(feedback[0][0].callback_data).id
+        message = storage.get_motivation_message(habit.user_id, rated) if rated else None
+        text, markup = answered_view(habit, day, on, message)
+        await query.message.edit_text(text, reply_markup=markup)
+        await query.answer(answer_note(habit, on, today=day == today))
+
+    def answered_view(
+        habit: Habit, day: date, on: bool | None, motivation: MotivationMessage | None
+    ) -> tuple[str, InlineKeyboardMarkup]:
+        """Напоминание после ответа: ответ и серия, мотивация с вопросом о ней; «Меню» и, пока
+        отзыва нет, кнопки отзыва."""
+        today = today_of(habit.user_id)
+        title = f"<b>{escape(habit.name)}</b>" + ("" if day == today else f" · {day:%d.%m}")
+        text = f"{title}\n{answer_note(habit, on, today=day == today)}\n{streak_line(habit, today)}"
         kb = InlineKeyboardBuilder()
-        for row in feedback:
-            kb.row(*row)
-        kb.row(*only_menu().inline_keyboard[0])
-        await query.message.edit_text(text, reply_markup=kb.as_markup())
-        await query.answer(note)
-        if asked and message is not None and message.feedback is None:
-            # Вопрос — ответом на напоминание, с цитатой мотивации. Если Telegram не найдёт
-            # цитату в тексте, вопрос уходит обычным ответом, без неё.
-            question, markup = feedback_question(asked)
-            reply = ReplyParameters(
-                message_id=query.message.message_id, allow_sending_without_reply=True
+        menu_button(kb)
+        if motivation is not None:
+            text += motivation_tail(motivation.text, motivation.feedback)
+            if motivation.feedback is None:
+                feedback_buttons(kb, motivation.id)
+        kb.adjust(1, 3)
+        return text, kb.as_markup()
+
+    async def show_feedback(query: CallbackQuery, message_id: int, label: str) -> None:
+        """Отзыв виден в том же сообщении: кнопки отзыва уходят, после вопроса — ответ."""
+        markup = query.message.reply_markup
+        rows = [
+            row
+            for row in (markup.inline_keyboard if markup else [])
+            if not any((b.callback_data or "").startswith("f:") for b in row)
+        ]
+        if not rows:
+            # Отдельный вопрос о мотивации из прежних версий: других кнопок в нём нет.
+            await query.message.edit_text(f"{FEEDBACK_QUESTION} — {label}")
+            return
+        message = storage.get_motivation_message(query.from_user.id, message_id)
+        habit = message and storage.get_habit(message.user_id, message.habit_id)
+        if habit is None:
+            await query.message.edit_reply_markup(
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
             )
-            try:
-                await query.message.answer(
-                    question,
-                    reply_markup=markup,
-                    reply_parameters=reply.model_copy(update={"quote": message.text}),
-                )
-            except TelegramBadRequest:
-                await query.message.answer(question, reply_markup=markup, reply_parameters=reply)
+            return
+        answering = any(
+            (b.callback_data or "").startswith(("q:", "r:")) for row in rows for b in row
+        )
+        if answering:  # на напоминание ещё не ответили
+            text, kb = reminder_message(
+                habit, message.day, (message.id, message.text), message.feedback
+            )
+        else:
+            text, kb = answered_view(
+                habit, message.day, storage.get_answer(habit.id, message.day), message
+            )
+        await query.message.edit_text(text, reply_markup=kb)
 
     @router.callback_query(FbCb.filter())
     async def rate_motivation(query: CallbackQuery, callback_data: FbCb) -> None:
@@ -1349,20 +1370,7 @@ def build_router(storage: Storage) -> Router:
         user_id = query.from_user.id
         label, delta, value = next(f for f in FEEDBACK if f[1] == max(-1, min(1, callback_data.v)))
         fresh = storage.set_motivation_feedback(user_id, callback_data.id, value)
-        # Кнопки отзыва убираем в любом случае; остальные кнопки сообщения остаются. В отдельном
-        # вопросе о мотивации других кнопок нет — там вместо них остаётся ответ.
-        markup = query.message.reply_markup
-        rows = [
-            row
-            for row in (markup.inline_keyboard if markup else [])
-            if not any((b.callback_data or "").startswith("f:") for b in row)
-        ]
-        if rows:
-            await query.message.edit_reply_markup(
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
-            )
-        else:
-            await query.message.edit_text(f"Как тебе такая мотивация? — {label}")
+        await show_feedback(query, callback_data.id, label)
         if not fresh:
             await query.answer("Отзыв уже учтён")
             return
@@ -1639,13 +1647,34 @@ def motivation_question() -> tuple[str, InlineKeyboardMarkup]:
     return text, kb.as_markup()
 
 
+FEEDBACK_QUESTION = "Как тебе такая мотивация?"
+
+
+def motivation_tail(words: str, feedback: str | None) -> str:
+    """Мотивация курсивом и вопрос о ней в конце сообщения; после отзыва — с ответом."""
+    question = FEEDBACK_QUESTION
+    label = next((f[0] for f in FEEDBACK if f[2] == feedback), None)
+    if label:
+        question += f" — {label}"
+    return f"\n\n<i>{escape(words)}</i>\n\n{question}"
+
+
+def feedback_buttons(kb: InlineKeyboardBuilder, message_id: int) -> None:
+    for label, delta, _ in FEEDBACK:
+        kb.button(text=label, callback_data=FbCb(id=message_id, v=delta))
+
+
 def reminder_message(
-    habit: Habit, day: date, motivation: tuple[int, str] | None = None
+    habit: Habit,
+    day: date,
+    motivation: tuple[int, str] | None = None,
+    feedback: str | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Напоминание про день `day`: сегодняшний или, у напоминаний на следующий день, вчерашний.
 
-    `motivation` — номер и текст мотивационного сообщения: текст идёт под вопросом, а вопрос
-    о мотивации приходит отдельным сообщением после ответа.
+    Кнопки: ответ, вторым рядом «Меню». `motivation` — номер и текст мотивационного
+    сообщения: текст идёт под вопросом, в конце — вопрос о мотивации, а третьим рядом кнопки
+    отзыва; `feedback` — уже данный отзыв, тогда вместо кнопок ответ после вопроса.
     """
     stamp = int(day.strftime("%Y%m%d"))
     title = f"{habit.icon} <b>{escape(habit.name)}</b>"
@@ -1670,18 +1699,13 @@ def reminder_message(
             text = f"⏰ {title} — получилось вчера ({day:%d.%m})?"
         else:
             text = f"⏰ Пора: {title}"
-    if motivation is None:
-        return text, kb.as_markup()
-    return f"{text}\n\n<i>{escape(motivation[1])}</i>", kb.as_markup()
-
-
-def feedback_question(message_id: int) -> tuple[str, InlineKeyboardMarkup]:
-    """Вопрос о мотивации — отдельным сообщением после ответа на напоминание."""
-    kb = InlineKeyboardBuilder()
-    for label, delta, _ in FEEDBACK:
-        kb.button(text=label, callback_data=FbCb(id=message_id, v=delta))
-    kb.adjust(3)
-    return "Как тебе такая мотивация? Отметь кнопкой — я подстрою тон.", kb.as_markup()
+    kb.button(text=BTN_MENU, callback_data=NavCb(action="menu"))
+    if motivation is not None:
+        text += motivation_tail(motivation[1], feedback)
+        if feedback is None:
+            feedback_buttons(kb, motivation[0])
+    kb.adjust(2, 1, 3)
+    return text, kb.as_markup()
 
 
 async def send_reminder(

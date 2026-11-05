@@ -433,7 +433,10 @@ async def test_several_habits_and_reminder_answer(bot: Harness) -> None:
     exercise = bot.storage.list_habits(42)[0]
     _, markup = reminder_message(exercise, today)
     answers = {b.text: b.callback_data for row in markup.inline_keyboard for b in row}
-    assert list(answers) == ["✅ Сделано", "Не сделано"]
+    assert [[b.text for b in row] for row in markup.inline_keyboard] == [
+        ["✅ Сделано", "Не сделано"],
+        ["☰ Меню"],
+    ]
     calls = await bot.press(answers["Не сделано"])
     assert "Записал: не сделано" in calls[0].text
     assert bot.storage.get_answer(exercise.id, datetime.now().date()) is False
@@ -740,71 +743,94 @@ async def test_reminder_with_motivation_and_feedback(bot: Harness) -> None:
     assert "Зарядка" in words
     assert bot.storage.get_motivation_message(42, message_id).source == "preset"
 
-    # В напоминании — текст, мотивация и только кнопки ответа.
+    # Одно сообщение: текст, мотивация и вопрос о ней в конце; кнопки — ответ, «Меню» вторым
+    # рядом, отзыв третьим.
     text, markup = reminder_message(habit, today, (message_id, words))
-    assert f"<i>{words}</i>" in text
+    assert text.endswith(f"<i>{words}</i>\n\nКак тебе такая мотивация?")
     assert [[b.text for b in row] for row in markup.inline_keyboard] == [
-        ["✅ Сделано", "Не сделано"]
+        ["✅ Сделано", "Не сделано"],
+        ["☰ Меню"],
+        ["🪶 Мягче", "👍 Хорошо", "💥 Жёстче"],
     ]
     labels = {b.text: b.callback_data for row in markup.inline_keyboard for b in row}
 
-    # Ответ: кнопки ответа уходят, мотивация остаётся, вопрос о ней приходит новым сообщением.
+    # Ответ: кнопки ответа уходят, мотивация с вопросом и кнопки отзыва остаются; нового
+    # сообщения нет.
     calls = await bot.press(labels["✅ Сделано"], markup=markup)
+    assert not any(type(c).__name__ == "SendMessage" for c in calls)
     answered = calls[0]
-    assert "Отмечено" in answered.text and f"<i>{words}</i>" in answered.text
-    assert rows(answered) == [["☰ Меню"]]
-    question = calls[-1]
-    assert type(question).__name__ == "SendMessage"
-    assert question.text.startswith("Как тебе такая мотивация?")
-    assert question.reply_parameters.message_id == 500  # ответ на само напоминание
-    assert question.reply_parameters.quote == words
-    assert rows(question) == [["🪶 Мягче", "👍 Хорошо", "💥 Жёстче"]]
+    assert "Отмечено" in answered.text
+    assert answered.text.endswith(f"<i>{words}</i>\n\nКак тебе такая мотивация?")
+    assert rows(answered) == [["☰ Меню"], ["🪶 Мягче", "👍 Хорошо", "💥 Жёстче"]]
     # Привычку отметили после сообщения — оно засчитывается стилю.
     assert bot.storage.get_motivation_message(42, message_id).acted
     assert bot.storage.motivation_stats(42) == {"support": (1, 1, 0)}
 
-    # «Жёстче» сдвигает тон, кнопки вопроса сменяются ответом; повторный отзыв не принимается.
-    rate = buttons(question)
-    calls = await bot.press(rate["💥 Жёстче"], markup=question.reply_markup)
-    assert calls[0].text == "Как тебе такая мотивация? — 💥 Жёстче"
+    # «Жёстче» сдвигает тон, кнопки отзыва сменяются ответом после вопроса; повторный отзыв
+    # не принимается.
+    rate = buttons(answered)
+    calls = await bot.press(rate["💥 Жёстче"], markup=answered.reply_markup)
+    assert "Отмечено" in calls[0].text
+    assert calls[0].text.endswith("Как тебе такая мотивация? — 💥 Жёстче")
+    assert rows(calls[0]) == [["☰ Меню"]]
     assert calls[-1].text == "Понял, буду жёстче"
     assert bot.storage.get_motivation(42).tone == 1
     assert bot.storage.get_motivation_message(42, message_id).feedback == "harder"
-    calls = await bot.press(rate["🪶 Мягче"], markup=question.reply_markup)
+    calls = await bot.press(rate["🪶 Мягче"], markup=answered.reply_markup)
     assert calls[-1].text == "Отзыв уже учтён" and bot.storage.get_motivation(42).tone == 1
 
-    # Повторный ответ на то же напоминание (кнопка из другого клиента) вопрос не присылает:
-    # отзыв уже дан.
+    # Повторный ответ на то же напоминание (кнопка из другого клиента): отзыв уже дан —
+    # вопрос с ответом, без кнопок отзыва.
     calls = await bot.press(labels["Не сделано"], markup=markup)
     assert not any(type(c).__name__ == "SendMessage" for c in calls)
+    assert calls[0].text.endswith("Как тебе такая мотивация? — 💥 Жёстче")
+    assert rows(calls[0]) == [["☰ Меню"]]
 
 
-async def test_feedback_question_without_quote_if_telegram_rejects_it(bot: Harness) -> None:
-    from aiogram.exceptions import TelegramBadRequest
-    from aiogram.methods import SendMessage
-
+async def test_feedback_before_answer_keeps_answer_buttons(bot: Harness) -> None:
     await add(bot, "Зарядка", "Полезная", "💪", "08:00")
     [habit] = bot.storage.list_habits(42)
     bot.storage.set_motivation_style(42, "support")
     today = datetime.now().date()
-    motivation = await Motivator(bot.storage, api_key="").compose(habit, today, today)
-    _, markup = reminder_message(habit, today, motivation)
+    message_id, words = await Motivator(bot.storage, api_key="").compose(habit, today, today)
+    _, markup = reminder_message(habit, today, (message_id, words))
 
-    send = bot.session.make_request
+    # Отзыв до ответа: кнопки ответа и «Меню» остаются, вопрос получает ответ.
+    calls = await bot.press(buttons_of(markup)["🪶 Мягче"], markup=markup)
+    rated = calls[0]
+    assert rated.text.startswith("⏰ Пора:")
+    assert rated.text.endswith(f"<i>{words}</i>\n\nКак тебе такая мотивация? — 🪶 Мягче")
+    assert rows(rated) == [["✅ Сделано", "Не сделано"], ["☰ Меню"]]
+    assert bot.storage.get_motivation(42).tone == -1
 
-    async def reject_quote(b, method, timeout=None):
-        if isinstance(method, SendMessage) and method.reply_parameters.quote:
-            raise TelegramBadRequest(method=method, message="QUOTE_TEXT_INVALID")
-        return await send(b, method, timeout)
+    # Ответ после отзыва: мотивация и ответ на вопрос остаются.
+    calls = await bot.press(buttons(rated)["✅ Сделано"], markup=rated.reply_markup)
+    assert "Отмечено" in calls[0].text
+    assert calls[0].text.endswith("Как тебе такая мотивация? — 🪶 Мягче")
+    assert rows(calls[0]) == [["☰ Меню"]]
 
-    bot.session.make_request = reject_quote
-    calls = await bot.press(
-        {b.text: b.callback_data for row in markup.inline_keyboard for b in row}["✅ Сделано"],
-        markup=markup,
+
+def buttons_of(markup: Any) -> dict[str, str]:
+    return {b.text: b.callback_data for row in markup.inline_keyboard for b in row}
+
+
+async def test_separate_question_sent_before_update_still_works(bot: Harness) -> None:
+    await add(bot, "Зарядка", "Полезная", "💪", "08:00")
+    [habit] = bot.storage.list_habits(42)
+    bot.storage.set_motivation_style(42, "support")
+    today = datetime.now().date()
+    message_id, _ = await Motivator(bot.storage, api_key="").compose(habit, today, today)
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    # Отдельное сообщение «Как тебе такая мотивация?» из прежней версии: только кнопки отзыва.
+    old = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👍 Хорошо", callback_data=f"f:{message_id}:0")]
+        ]
     )
-    question = calls[-1]
-    assert question.text.startswith("Как тебе такая мотивация?")
-    assert question.reply_parameters.message_id == 500 and question.reply_parameters.quote is None
+    calls = await bot.press(f"f:{message_id}:0", markup=old)
+    assert calls[0].text == "Как тебе такая мотивация? — 👍 Хорошо"
+    assert calls[-1].text == "Спасибо, учту"
 
 
 async def test_reminder_sent_before_update_keeps_feedback_buttons(bot: Harness) -> None:
@@ -824,8 +850,8 @@ async def test_reminder_sent_before_update_keeps_feedback_buttons(bot: Harness) 
         ]
     )
     calls = await bot.press(f"r:{habit.id}:{stamp}:1", markup=old)
-    assert f"<i>{words}</i>" in calls[0].text
-    assert rows(calls[0]) == [["💥 Жёстче"], ["☰ Меню"]]
+    assert calls[0].text.endswith(f"<i>{words}</i>\n\nКак тебе такая мотивация?")
+    assert rows(calls[0]) == [["☰ Меню"], ["🪶 Мягче", "👍 Хорошо", "💥 Жёстче"]]
     assert not any(type(c).__name__ == "SendMessage" for c in calls)
 
 
