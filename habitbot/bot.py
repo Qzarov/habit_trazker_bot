@@ -1354,10 +1354,8 @@ def build_router(storage: Storage) -> Router:
         answering = any(
             (b.callback_data or "").startswith(("q:", "r:")) for row in rows for b in row
         )
-        if answering:  # на напоминание ещё не ответили
-            text, kb = reminder_message(
-                habit, message.day, (message.id, message.text), message.feedback
-            )
+        if answering:  # напоминание прежнего вида, на которое ещё не ответили
+            text, kb = reminder_message(habit, message.day, (message.id, message.text))
         else:
             text, kb = answered_view(
                 habit, message.day, storage.get_answer(habit.id, message.day), message
@@ -1668,13 +1666,12 @@ def reminder_message(
     habit: Habit,
     day: date,
     motivation: tuple[int, str] | None = None,
-    feedback: str | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """Напоминание про день `day`: сегодняшний или, у напоминаний на следующий день, вчерашний.
 
     Кнопки: ответ, вторым рядом «Меню». `motivation` — номер и текст мотивационного
-    сообщения: текст идёт под вопросом, в конце — вопрос о мотивации, а третьим рядом кнопки
-    отзыва; `feedback` — уже данный отзыв, тогда вместо кнопок ответ после вопроса.
+    сообщения: текст идёт под вопросом; вопрос о мотивации и кнопки отзыва появляются в этом же
+    сообщении после ответа (`answered_view`).
     """
     stamp = int(day.strftime("%Y%m%d"))
     title = f"{habit.icon} <b>{escape(habit.name)}</b>"
@@ -1700,11 +1697,9 @@ def reminder_message(
         else:
             text = f"⏰ Пора: {title}"
     kb.button(text=BTN_MENU, callback_data=NavCb(action="menu"))
+    kb.adjust(2, 1)
     if motivation is not None:
-        text += motivation_tail(motivation[1], feedback)
-        if feedback is None:
-            feedback_buttons(kb, motivation[0])
-    kb.adjust(2, 1, 3)
+        text += f"\n\n<i>{escape(motivation[1])}</i>"
     return text, kb.as_markup()
 
 

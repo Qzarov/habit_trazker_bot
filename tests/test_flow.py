@@ -743,19 +743,19 @@ async def test_reminder_with_motivation_and_feedback(bot: Harness) -> None:
     assert "Зарядка" in words
     assert bot.storage.get_motivation_message(42, message_id).source == "preset"
 
-    # Одно сообщение: текст, мотивация и вопрос о ней в конце; кнопки — ответ, «Меню» вторым
-    # рядом, отзыв третьим.
+    # В напоминании — текст и мотивация; кнопки — ответ и «Меню» вторым рядом. О мотивации
+    # пока не спрашиваем.
     text, markup = reminder_message(habit, today, (message_id, words))
-    assert text.endswith(f"<i>{words}</i>\n\nКак тебе такая мотивация?")
+    assert text.endswith(f"<i>{words}</i>")
+    assert "Как тебе" not in text
     assert [[b.text for b in row] for row in markup.inline_keyboard] == [
         ["✅ Сделано", "Не сделано"],
         ["☰ Меню"],
-        ["🪶 Мягче", "👍 Хорошо", "💥 Жёстче"],
     ]
     labels = {b.text: b.callback_data for row in markup.inline_keyboard for b in row}
 
-    # Ответ: кнопки ответа уходят, мотивация с вопросом и кнопки отзыва остаются; нового
-    # сообщения нет.
+    # Ответ: кнопки ответа уходят, в том же сообщении появляются вопрос о мотивации и кнопки
+    # отзыва; нового сообщения нет.
     calls = await bot.press(labels["✅ Сделано"], markup=markup)
     assert not any(type(c).__name__ == "SendMessage" for c in calls)
     answered = calls[0]
@@ -787,31 +787,33 @@ async def test_reminder_with_motivation_and_feedback(bot: Harness) -> None:
     assert rows(calls[0]) == [["☰ Меню"]]
 
 
-async def test_feedback_before_answer_keeps_answer_buttons(bot: Harness) -> None:
+async def test_feedback_before_answer_on_reminder_sent_before_update(bot: Harness) -> None:
     await add(bot, "Зарядка", "Полезная", "💪", "08:00")
     [habit] = bot.storage.list_habits(42)
     bot.storage.set_motivation_style(42, "support")
     today = datetime.now().date()
     message_id, words = await Motivator(bot.storage, api_key="").compose(habit, today, today)
-    _, markup = reminder_message(habit, today, (message_id, words))
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-    # Отзыв до ответа: кнопки ответа и «Меню» остаются, вопрос получает ответ.
-    calls = await bot.press(buttons_of(markup)["🪶 Мягче"], markup=markup)
+    # Напоминание прежнего вида: кнопки отзыва стоят сразу, до ответа.
+    stamp = today.strftime("%Y%m%d")
+    old = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Сделано", callback_data=f"r:{habit.id}:{stamp}:1")],
+            [InlineKeyboardButton(text="🪶 Мягче", callback_data=f"f:{message_id}:-1")],
+        ]
+    )
+    calls = await bot.press(f"f:{message_id}:-1", markup=old)
     rated = calls[0]
-    assert rated.text.startswith("⏰ Пора:")
-    assert rated.text.endswith(f"<i>{words}</i>\n\nКак тебе такая мотивация? — 🪶 Мягче")
+    assert rated.text.startswith("⏰ Пора:") and rated.text.endswith(f"<i>{words}</i>")
     assert rows(rated) == [["✅ Сделано", "Не сделано"], ["☰ Меню"]]
     assert bot.storage.get_motivation(42).tone == -1
 
-    # Ответ после отзыва: мотивация и ответ на вопрос остаются.
+    # Ответ после отзыва: мотивация и ответ на вопрос, без кнопок отзыва.
     calls = await bot.press(buttons(rated)["✅ Сделано"], markup=rated.reply_markup)
     assert "Отмечено" in calls[0].text
     assert calls[0].text.endswith("Как тебе такая мотивация? — 🪶 Мягче")
     assert rows(calls[0]) == [["☰ Меню"]]
-
-
-def buttons_of(markup: Any) -> dict[str, str]:
-    return {b.text: b.callback_data for row in markup.inline_keyboard for b in row}
 
 
 async def test_separate_question_sent_before_update_still_works(bot: Harness) -> None:
